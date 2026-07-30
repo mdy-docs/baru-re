@@ -1493,11 +1493,54 @@ static inline unsigned int hash_state(const Thread* t, int counter_count) {
     return h % CACHE_SIZE;
 }
 
-bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
-    Thread stack[512];
-    int stack_ptr = 0;
-    
+/*
+ * STOPGAP. The real fix is upstream already -- see the end of this note.
+ *
+ * The backtracking stack and the ReDoS fail cache, together, on the heap.
+ * They were plain locals. On wasm32 that made ONE frame of this function
+ * 1,114,112 + 65,536 bytes -- larger than the whole 1 MB stack that both
+ * the emscripten and the WASI builds configure, so every regex evaluation
+ * wrote past the stack limit. -sSTACK_OVERFLOW_CHECK=1 does not sample
+ * often enough to catch it, so it corrupted silently instead of trapping;
+ * at =2 eight of the consumer's $regex tests abort immediately.
+ *
+ * It went unseen because it is only wrong on the target this code ships
+ * to: natively the frame is 2.3 MB inside an 8 MB stack, comfortable, and
+ * every C test until now ran natively.
+ *
+ * Costs about 15% of scan throughput: over a 2,000-document collection,
+ * 48.5k evaluations/s with the arrays on the stack against 41k here. A
+ * reusable per-thread buffer lent to the outermost call was tried to win
+ * that back and measured no better (41.5k), so it is not here -- the cost
+ * is not the allocator, which serves a repeated same-size request from
+ * its free list, but the 1.2 MB this touches on every evaluation.
+ *
+ * Why this is a stopgap. The consumer pins this submodule 33 commits
+ * behind its main, where the engine was split into re_lexer/re_parser/
+ * re_compiler/re_vm and this whole area was rebuilt properly: a heap
+ * VMContext with per-recursion-depth scratch, a backtrack stack that
+ * grows on demand to VM_STACK_MAX and abandons rather than overflows, a
+ * Thread right-sized to the pattern instead of embedding MAX_GROUPS*2
+ * slots, and a step budget against ReDoS. That branch also carries P0
+ * crash/memory-corruption and P1 OOB-read fixes this pinned copy does not
+ * have. Bumping the pointer is the actual remedy and deletes this file;
+ * this patch exists only so the shipped build is not corrupting memory in
+ * the meantime, and it disappears with the file when the bump lands.
+ */typedef struct {
+    Thread     stack[512];
     CacheEntry fail_cache[CACHE_SIZE];
+} vm_scratch;
+
+bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
+    /* No match is the safe answer when this cannot allocate: the caller is
+     * a filter, and excluding a document is recoverable where wrongly
+     * including one is not. There is no error channel through a bool. */
+    vm_scratch* sc = (vm_scratch*)malloc(sizeof(vm_scratch));
+    if (!sc) return false;
+    Thread* stack = sc->stack;
+    CacheEntry* fail_cache = sc->fail_cache;
+    int stack_ptr = 0;
+
     for (int i = 0; i < CACHE_SIZE; i++) fail_cache[i].pc = -1;
     
     Thread init_thread = {start_pc, search_start, {NULL}, {0}, {NULL}};
@@ -1779,11 +1822,13 @@ bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* 
             else if (inst.op == OP_JMP) { current.pc = inst.arg1; } 
             else if (inst.op == OP_MATCH) {
                 if (out_captures) memcpy((void*)out_captures, current.captures, sizeof(const uint16_t*) * MAX_GROUPS * 2);
+                free(sc);
                 return true; 
             }
         }
         if (path_failed) { fail_cache[h].pc = path_start_pc; fail_cache[h].sp = path_start_sp; }
     }
+    free(sc);
     return false;
 }
 
