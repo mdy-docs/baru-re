@@ -16,6 +16,15 @@
 
 #include "regexp.h"
 
+/* The single message every COMPILE-TIME allocation failure reports through
+ * (assigned to Program.error, whose contents are always static literals).
+ * Compilation treats running out of memory exactly like exceeding one of the
+ * MAX_* bounds -- the failing site records it, the surrounding code keeps
+ * running over whatever half-built structure it has, and regex_compile
+ * discards the Program without ever handing it to the VM. Defined in
+ * re_compiler.c. */
+extern const char* const re_oom_error;
+
 /* ---- Lexer (re_lexer.c) --------------------------------------------------
  * Token/TokenType/Lexer are defined here rather than in re_lexer.c itself
  * because re_parser.c (every parse_* function takes a Lexer*) and

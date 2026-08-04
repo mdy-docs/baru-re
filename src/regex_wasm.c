@@ -154,9 +154,18 @@ int regex_exec(uintptr_t handle, const uint16_t* text, int text_units, int start
 
     /* One context for the handle's whole lifetime, not one per call (see
      * RegexHandle above). Re-arming the budget every call also resets the
-     * context's sticky exhaustion state, so one runaway subject doesn't
-     * poison later execs on the same handle. */
+     * context's sticky BUDGET exhaustion, so one runaway subject doesn't
+     * poison later execs on the same handle. A context that hit an
+     * allocation failure stays refused for good, by design (see regexp.h). */
     if (!h->ctx) h->ctx = vm_context_new(&h->prog);
+    if (!h->ctx) {
+        /* Out of memory: the match was not evaluated, so report it the way
+         * an exhausted budget is reported rather than as a clean no-match. */
+        h->budget_exhausted = 1;
+        int pairs = (h->prog.group_count + 1) * 2;
+        for (int i = 0; i < pairs; i++) h->captures[i] = -1;
+        return 0;
+    }
     VMContext* ctx = h->ctx;
     vm_context_set_step_budget(ctx, h->step_budget);
 

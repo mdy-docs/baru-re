@@ -10,7 +10,6 @@
  * CLAUDE.md/README.md's "Provenance" section for why that diverges from
  * upstream's layout.
  */
-#include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,11 +20,18 @@
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
-static ASTNode* create_node(ASTType type) {
+/* Returns NULL on allocation failure, having recorded it in prog->error.
+ * NULL is not a special case in this AST: an empty alternative (/a|/)
+ * already produces one, and every consumer -- compile_node, free_ast,
+ * node_depth, all three validators -- short-circuits on it, so the failure
+ * propagates outward as an empty subtree. What callers here must do is (a)
+ * not dereference the result, and (b) free any child they had already built
+ * and were about to hand to it, since nothing else owns it. */
+static ASTNode* create_node(Lexer* lexer, ASTType type) {
     ASTNode* node = calloc(1, sizeof(ASTNode));
     if (!node) {
-        fprintf(stderr, "Fatal Error: Out of memory\n");
-        exit(EXIT_FAILURE);
+        if (!lexer->prog->error) lexer->prog->error = re_oom_error;
+        return NULL;
     }
     node->type = type;
     node->depth = 1; /* a freshly-created node is a leaf until finish_node()
@@ -58,14 +64,14 @@ static ASTNode* finish_node(Lexer* lexer, ASTNode* node) {
 
 static ASTNode* parse_primary(Lexer* lexer) {
     ASTNode* node = NULL;
-    if (lexer->current.type == TOK_LITERAL) { node = create_node(AST_LITERAL); node->ch = lexer->current.ch; next_token(lexer); } 
-    else if (lexer->current.type == TOK_CLASS) { node = create_node(AST_CLASS); node->id = lexer->current.class_id; next_token(lexer); } 
-    else if (lexer->current.type == TOK_CARET) { node = create_node(AST_ASSERT_START); next_token(lexer); } 
-    else if (lexer->current.type == TOK_DOLLAR) { node = create_node(AST_ASSERT_END); next_token(lexer); } 
-    else if (lexer->current.type == TOK_BACKREF) { node = create_node(AST_BACKREF); node->id = lexer->current.class_id; next_token(lexer); } 
-    else if (lexer->current.type == TOK_NAMED_BACKREF) { node = create_node(AST_NAMED_BACKREF); strcpy(node->name, lexer->current.name); next_token(lexer); } 
-    else if (lexer->current.type == TOK_WORD_BOUNDARY) { node = create_node(AST_WORD_BOUNDARY); next_token(lexer); } 
-    else if (lexer->current.type == TOK_NON_WORD_BOUNDARY) { node = create_node(AST_NON_WORD_BOUNDARY); next_token(lexer); } 
+    if (lexer->current.type == TOK_LITERAL) { node = create_node(lexer, AST_LITERAL); if (node) node->ch = lexer->current.ch; next_token(lexer); }
+    else if (lexer->current.type == TOK_CLASS) { node = create_node(lexer, AST_CLASS); if (node) node->id = lexer->current.class_id; next_token(lexer); }
+    else if (lexer->current.type == TOK_CARET) { node = create_node(lexer, AST_ASSERT_START); next_token(lexer); }
+    else if (lexer->current.type == TOK_DOLLAR) { node = create_node(lexer, AST_ASSERT_END); next_token(lexer); }
+    else if (lexer->current.type == TOK_BACKREF) { node = create_node(lexer, AST_BACKREF); if (node) node->id = lexer->current.class_id; next_token(lexer); }
+    else if (lexer->current.type == TOK_NAMED_BACKREF) { node = create_node(lexer, AST_NAMED_BACKREF); if (node) strcpy(node->name, lexer->current.name); next_token(lexer); }
+    else if (lexer->current.type == TOK_WORD_BOUNDARY) { node = create_node(lexer, AST_WORD_BOUNDARY); next_token(lexer); }
+    else if (lexer->current.type == TOK_NON_WORD_BOUNDARY) { node = create_node(lexer, AST_NON_WORD_BOUNDARY); next_token(lexer); }
     else if (lexer->current.type == TOK_LPAREN || lexer->current.type == TOK_LOOKAHEAD || lexer->current.type == TOK_NEG_LOOKAHEAD || lexer->current.type == TOK_LOOKBEHIND || lexer->current.type == TOK_NEG_LOOKBEHIND || lexer->current.type == TOK_NONCAP_GROUP || lexer->current.type == TOK_NAMED_GROUP || lexer->current.type == TOK_MODIFIER_GROUP) {
         bool is_la = (lexer->current.type == TOK_LOOKAHEAD);
         bool is_neg_la = (lexer->current.type == TOK_NEG_LOOKAHEAD);
@@ -155,12 +161,17 @@ static ASTNode* parse_primary(Lexer* lexer) {
         }
 
         if (is_modifier) {
-            node = create_node(AST_MODIFIER_GROUP);
-            node->flags_on = flags_on;
-            node->flags_off = flags_off;
+            node = create_node(lexer, AST_MODIFIER_GROUP);
+            if (node) {
+                node->flags_on = flags_on;
+                node->flags_off = flags_off;
+            }
         } else {
-            node = create_node(is_la ? AST_LOOKAHEAD : (is_neg_la ? AST_NEG_LOOKAHEAD : (is_lb ? AST_LOOKBEHIND : (is_neg_lb ? AST_NEG_LOOKBEHIND : AST_GROUP))));
+            node = create_node(lexer, is_la ? AST_LOOKAHEAD : (is_neg_la ? AST_NEG_LOOKAHEAD : (is_lb ? AST_LOOKBEHIND : (is_neg_lb ? AST_NEG_LOOKBEHIND : AST_GROUP))));
         }
+        /* The body was parsed before its wrapper could be allocated, and
+         * nothing else references it. */
+        if (!node) { free_ast(inner); return NULL; }
         node->left = inner;
         node = finish_node(lexer, node);
         if (is_capture) {
@@ -181,7 +192,8 @@ static ASTNode* parse_quantifier(Lexer* lexer) {
             node->type == AST_LOOKBEHIND || node->type == AST_NEG_LOOKBEHIND) {
             lexer->prog->error = "SyntaxError: Invalid quantifier applied to assertion";
         }
-        ASTNode* q = create_node(AST_QUANTIFIER);
+        ASTNode* q = create_node(lexer, AST_QUANTIFIER);
+        if (!q) { free_ast(node); return NULL; }
         q->left = node;
         if (t == TOK_STAR)      { q->min = 0; q->max = -1; }
         else if (t == TOK_PLUS) { q->min = 1; q->max = -1; }
@@ -208,21 +220,37 @@ static ASTNode* parse_quantifier(Lexer* lexer) {
 static ASTNode* build_balanced(Lexer* lexer, ASTType type, ASTNode** items, int lo, int hi) {
     if (lo >= hi) return items[lo];
     int mid = lo + (hi - lo) / 2;
-    ASTNode* n = create_node(type);
-    n->left = build_balanced(lexer, type, items, lo, mid);
-    n->right = build_balanced(lexer, type, items, mid + 1, hi);
+    ASTNode* n = create_node(lexer, type);
+    /* Both halves are built even when the join node couldn't be allocated:
+     * items[] is the only reference to them, and it is about to be freed by
+     * the caller, so they have to be released here or leak. */
+    ASTNode* left = build_balanced(lexer, type, items, lo, mid);
+    ASTNode* right = build_balanced(lexer, type, items, mid + 1, hi);
+    if (!n) {
+        free_ast(left);
+        free_ast(right);
+        return NULL;
+    }
+    n->left = left;
+    n->right = right;
     return finish_node(lexer, n);
 }
 
-static ASTNode** items_push(ASTNode** items, int* count, int* cap, ASTNode* node) {
+/* On allocation failure the array and everything already in it survive
+ * intact -- only `node`, which had nowhere to go, is released. The caller
+ * keeps building from a short items[], which is harmless: prog->error is
+ * set, so the truncated AST is never compiled. */
+static ASTNode** items_push(Lexer* lexer, ASTNode** items, int* count, int* cap, ASTNode* node) {
     if (*count == *cap) {
-        *cap *= 2;
-        ASTNode** grown = realloc(items, sizeof(ASTNode*) * (size_t)*cap);
+        int new_cap = *cap * 2;
+        ASTNode** grown = realloc(items, sizeof(ASTNode*) * (size_t)new_cap);
         if (!grown) {
-            fprintf(stderr, "Fatal Error: Out of memory\n");
-            exit(EXIT_FAILURE);
+            if (!lexer->prog->error) lexer->prog->error = re_oom_error;
+            free_ast(node);
+            return items;
         }
         items = grown;
+        *cap = new_cap;
     }
     items[(*count)++] = node;
     return items;
@@ -249,14 +277,14 @@ static ASTNode* parse_concat(Lexer* lexer) {
     int cap = 8, count = 0;
     ASTNode** items = malloc(sizeof(ASTNode*) * (size_t)cap);
     if (!items) {
-        fprintf(stderr, "Fatal Error: Out of memory\n");
-        exit(EXIT_FAILURE);
+        if (!lexer->prog->error) lexer->prog->error = re_oom_error;
+        return node; /* the atom already parsed is still the caller's */
     }
-    items = items_push(items, &count, &cap, node);
+    items = items_push(lexer, items, &count, &cap, node);
     while (starts_atom(lexer->current.type)) {
         ASTNode* right = parse_quantifier(lexer);
         if (!right) break;
-        items = items_push(items, &count, &cap, right);
+        items = items_push(lexer, items, &count, &cap, right);
     }
     node = build_balanced(lexer, AST_CONCAT, items, 0, count - 1);
     free(items);
@@ -278,9 +306,9 @@ ASTNode* parse_alt(Lexer* lexer) {
          * compile_into) unwinds quickly once prog->error is set, since
          * next_token() starts short-circuiting to TOK_EOF immediately --
          * what's returned here barely matters structurally, it just needs
-         * to be a valid, non-NULL node for callers that dereference it
-         * (e.g. parse_quantifier checking node->type). */
-        return create_node(AST_LITERAL);
+         * to be something the caller can attach and free like any other
+         * subtree -- including NULL, if even this allocation fails. */
+        return create_node(lexer, AST_LITERAL);
     }
     ASTNode* node = parse_concat(lexer);
     if (lexer->current.type == TOK_OR) {
@@ -292,13 +320,14 @@ ASTNode* parse_alt(Lexer* lexer) {
         int cap = 8, count = 0;
         ASTNode** items = malloc(sizeof(ASTNode*) * (size_t)cap);
         if (!items) {
-            fprintf(stderr, "Fatal Error: Out of memory\n");
-            exit(EXIT_FAILURE);
+            if (!lexer->prog->error) lexer->prog->error = re_oom_error;
+            lexer->parse_depth--;
+            return node; /* the first alternative is still the caller's */
         }
-        items = items_push(items, &count, &cap, node);
+        items = items_push(lexer, items, &count, &cap, node);
         while (lexer->current.type == TOK_OR) {
             next_token(lexer);
-            items = items_push(items, &count, &cap, parse_concat(lexer));
+            items = items_push(lexer, items, &count, &cap, parse_concat(lexer));
         }
         node = build_balanced(lexer, AST_ALT, items, 0, count - 1);
         free(items);
@@ -326,8 +355,8 @@ bool validate_group_names(ASTNode* node, NameSet* out_set, const char** error) {
      * depth cap could be raised; see MAX_AST_DEPTH in include/regexp.h. */
     NameSet* sets = calloc(2, sizeof(NameSet));
     if (!sets) {
-        fprintf(stderr, "Fatal Error: Out of memory\n");
-        exit(EXIT_FAILURE);
+        if (!*error) *error = re_oom_error;
+        return false; /* nothing allocated yet, so nothing to unwind */
     }
     NameSet* left_set = &sets[0];
     NameSet* right_set = &sets[1];

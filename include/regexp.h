@@ -196,6 +196,9 @@ void program_release(Program* prog);
  * dominated the runtime by orders of magnitude. A context is tied to the group count of the Program it was
  * created for, and is not thread-safe -- one context per thread. */
 typedef struct VMContext VMContext;
+/* NULL if the context could not be allocated. A caller that treats that as
+ * "no match" reports a wrong answer; treat it like budget exhaustion below
+ * -- the match could not be evaluated. */
 VMContext* vm_context_new(const Program* prog);
 void vm_context_free(VMContext* ctx);
 
@@ -214,7 +217,14 @@ void vm_context_free(VMContext* ctx);
  * backtrack exponentially without a budget. Embedders running untrusted
  * patterns should always set one; a budget linear in the subject length
  * (e.g. 1e6 + 2000/unit) bounds superlinear blowup while leaving orders of
- * magnitude of headroom for legitimate matching. */
+ * magnitude of headroom for legitimate matching.
+ *
+ * A match-time ALLOCATION FAILURE (the VM's backtrack stack and fail cache
+ * grow on demand) abandons the in-flight match identically and reports
+ * through this same flag: to a host the two are one condition -- "the
+ * engine could not finish this match" -- which must surface as an error,
+ * never as a non-match. Compile-time allocation failures are separate; they
+ * report through Program.error like any other compile error. */
 void vm_context_set_step_budget(VMContext* ctx, uint64_t max_steps);
 bool vm_context_budget_exhausted(const VMContext* ctx);
 bool vm_execute(Program* prog, VMContext* ctx, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures);

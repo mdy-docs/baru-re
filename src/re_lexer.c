@@ -13,7 +13,6 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,6 +21,22 @@
 #include "re_internal.h"
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+
+/* Allocation-failure latch for character-class construction. The two
+ * functions that grow a CharClass (ranges_reserve, class_strings_push) sit
+ * under ~30 call sites -- add_range alone has 25 -- and most of those build
+ * scratch classes (set-algebra temporaries, \p{...} cache entries, builtin
+ * fills) with no Lexer or Program anywhere in reach, so threading a status
+ * back out through every one of them would dwarf the condition being
+ * reported. They latch here instead, and next_token converts the latch into
+ * prog->error before it returns. That is airtight because every
+ * class-building call chain in this file runs to completion inside exactly
+ * one next_token invocation, so the latch cannot outlive the token that set
+ * it: a class truncated by a failed allocation is ALWAYS paired with
+ * prog->error, and the Program is discarded before the VM can match against
+ * it. Not thread-safe, in the same way (and for the same audience) as the
+ * \p{...} prop_cache below. */
+static bool class_oom;
 
 static inline uint32_t decode_utf16_lexer(Lexer* lexer) {
     uint32_t cp = lexer->src[lexer->pos];
@@ -284,8 +299,8 @@ static bool parse_group_name(Lexer* lexer, char* out) {
 /* Appends one sequence to a class's heap-owned string set, growing it as
  * needed. No fixed cap (the point of this design: the previous embedded
  * strings[128] silently truncated RGI_Emoji's 2604
- * sequences); allocation failure is fatal, matching the engine's OOM
- * policy everywhere else. Deduplication is the caller's business
+ * sequences); a failed grow drops the sequence and latches class_oom.
+ * Deduplication is the caller's business
  * (class_add_string) -- property fills come from already-duplicate-free
  * UCD tables and skip the scan. */
 static void class_strings_push(CharClass* cls, const StringSequence* s) {
@@ -293,8 +308,8 @@ static void class_strings_push(CharClass* cls, const StringSequence* s) {
         int new_cap = cls->string_cap ? cls->string_cap * 2 : 16;
         StringSequence* grown = realloc(cls->strings, sizeof(StringSequence) * (size_t)new_cap);
         if (!grown) {
-            fprintf(stderr, "Fatal Error: Out of memory\n");
-            exit(EXIT_FAILURE);
+            class_oom = true;
+            return;
         }
         cls->strings = grown;
         cls->string_cap = new_cap;
@@ -322,19 +337,24 @@ void class_free(CharClass* cls) {
     cls->range_cap = 0;
 }
 
-static void ranges_reserve(CharClass* cls, int need) {
-    if (need <= cls->range_cap) return;
+static bool ranges_reserve(CharClass* cls, int need) {
+    if (need <= cls->range_cap) return true;
     int new_cap = cls->range_cap ? cls->range_cap * 2 : 16;
     while (new_cap < need) new_cap *= 2;
     CodePointRange* grown = realloc(cls->ranges, sizeof(CodePointRange) * (size_t)new_cap);
     if (!grown) {
-        fprintf(stderr, "Fatal Error: Out of memory\n");
-        exit(EXIT_FAILURE);
+        class_oom = true;
+        return false;
     }
     cls->ranges = grown;
     cls->range_cap = new_cap;
+    return true;
 }
 
+/* Returns whether the class now contains [start, end] -- false only when the
+ * range set could not grow, which class_oom has recorded. The one caller
+ * that reads the result (apply_case_folding's closure loop) wants exactly
+ * that reading: a range it failed to add is not a change to iterate on. */
 static bool add_range(CharClass* cls, uint32_t start, uint32_t end) {
     if (start > end) return true;
 
@@ -384,9 +404,8 @@ static bool add_range(CharClass* cls, uint32_t start, uint32_t end) {
      * array whose exhaustion silently DROPPED ranges. The count is
      * intrinsically bounded by pattern content and property-table sizes
      * (set ops produce at most the sum of their operands' counts), so
-     * growth is modest in practice; allocation failure stays fatal per the
-     * engine-wide OOM policy. */
-    ranges_reserve(cls, cls->range_count + 1);
+     * growth is modest in practice. */
+    if (!ranges_reserve(cls, cls->range_count + 1)) return false;
 
     for (int j = cls->range_count; j > i; j--) {
         cls->ranges[j] = cls->ranges[j-1];
@@ -545,6 +564,15 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
         memset(build, 0, sizeof(CharClass));
         for (int i = 0; i < ucd_prop->count; i++) {
             add_range(build, ucd_prop->ranges[i].start, ucd_prop->ranges[i].end);
+        }
+        /* A build truncated by a failed allocation must never be committed
+         * to the process-lifetime cache: unlike every other consequence of
+         * an OOM here, a poisoned cache entry would silently mis-match in
+         * LATER compiles, long after the failure that produced it was
+         * reported and the affected Program discarded. */
+        if (class_oom) {
+            class_free(build);
+            return false;
         }
         if (prop_cache_count < MAX_PROP_CACHE) {
             prop_cache[prop_cache_count].kind = kind;
@@ -1301,8 +1329,11 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
      * made the garbage-free reachable, fuzzer-found.) */
     CharClass* tmp = calloc(1, sizeof(CharClass));
     if (!tmp) {
-        fprintf(stderr, "Fatal Error: Out of memory\n");
-        exit(EXIT_FAILURE);
+        /* A Lexer is in hand here, so report directly rather than through
+         * class_oom -- it stops the enclosing parse immediately. */
+        if (!lexer->prog->error) lexer->prog->error = re_oom_error;
+        lexer->parse_depth--;
+        return;
     }
 
     if (lexer->src[lexer->pos] != ']' && lexer->src[lexer->pos] != '\0') {
@@ -1380,9 +1411,8 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
     lexer->parse_depth--;
 }
 
-/* Non-static: called from every parse_* function in re_parser.c and from
- * re_compiler.c's compile_into. Declared in re_internal.h. */
-void next_token(Lexer* lexer) {
+/* The scanner proper; next_token below wraps it. */
+static void scan_token(Lexer* lexer) {
     if (lexer->prog->error) {
         lexer->current = (Token){TOK_EOF, 0, 0, 0, 0, ""};
         return;
@@ -1682,4 +1712,22 @@ void next_token(Lexer* lexer) {
             break;
         default: lexer->current = (Token){TOK_LITERAL, c}; break;
     }
+}
+
+/* Non-static: called from every parse_* function in re_parser.c and from
+ * re_compiler.c's compile_into. Declared in re_internal.h.
+ *
+ * Owns the class_oom latch's whole lifetime (see the top of this file):
+ * cleared before the scan, converted to prog->error after it. The
+ * conversion deliberately OVERRIDES an error recorded during this same
+ * token rather than deferring to it -- an allocation failure inside class
+ * construction usually surfaces first as a bogus SyntaxError from whichever
+ * caller then saw a truncated or rejected class ("Invalid property escape"
+ * is the common one), and reporting that instead of the real cause would be
+ * actively misleading. Nothing older can be masked: an error set by an
+ * earlier token short-circuits the scan above before any class is built. */
+void next_token(Lexer* lexer) {
+    class_oom = false;
+    scan_token(lexer);
+    if (class_oom) lexer->prog->error = re_oom_error;
 }

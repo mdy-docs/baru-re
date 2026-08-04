@@ -14,7 +14,6 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -23,6 +22,10 @@
 #include "re_internal.h"
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+
+/* Declared in re_internal.h; see there for the policy this message belongs
+ * to. */
+const char* const re_oom_error = "InternalError: out of memory compiling pattern";
 
 /* Under /i the fold both sides of an OP_CHAR comparison get is fixed at
  * compile time (whether /u applies is a whole-pattern fact, and modifier
@@ -34,28 +37,37 @@ static uint32_t emit_char_operand(const Program* prog, uint32_t ch) {
     return prog->unicode ? unicode_casefold(ch) : annexb_canonicalize(ch);
 }
 
+/* Not a valid instruction index: emit() returns it when it produced no
+ * instruction at all, either because MAX_OPCODES is exhausted or because the
+ * code array could not grow. Both set prog->error, so the Program is
+ * discarded by regex_compile() without ever reaching the VM (see
+ * src/regex_wasm.c) -- the rest of the compile walk just has to stay
+ * memory-safe over the bytecode it never finished. It matches the -1 the
+ * "no split was emitted" case in compile_class_with_strings already used. */
+#define EMIT_NONE (-1)
+
 /* The code array is heap-owned and grown here on demand (it was a fixed
  * Instruction[MAX_OPCODES] embedded array -- 786KB per Program regardless
- * of pattern size); MAX_OPCODES survives as the hard cap. Once the cap is
- * hit, prog->error is set and every subsequent call clamps to the last
- * valid slot instead of indexing out of bounds; callers keep patching that
- * slot's fields (`prog->code[returned_idx].argN = ...`) after the fact,
- * which produces nonsensical-but-safe bytecode that's never actually run,
- * since a Program with prog->error set is discarded by regex_compile()
- * without ever reaching the VM (see src/regex_wasm.c). The clamp index is
- * always in-bounds: this branch is only reachable once code_count == cap
- * == MAX_OPCODES, so slot code_count-1 exists. */
+ * of pattern size); MAX_OPCODES survives as the hard cap.
+ *
+ * Failure is EMIT_NONE rather than a clamp to the last valid slot (which is
+ * what the MAX_OPCODES branch used to return): on an allocation failure
+ * there may be no valid slot to clamp to -- if the very first emit of a
+ * compile fails, prog->code is still NULL and code_count still 0, so
+ * "clamping" to slot 0 and letting a caller backpatch it would be a NULL
+ * write. Callers never index the result themselves; they backpatch through
+ * the patch_* helpers below, which ignore EMIT_NONE. */
 static int emit(Program* prog, RegexOpCode op, int arg1, int arg2, int arg3, int arg4, bool lazy) {
     if (prog->code_count >= MAX_OPCODES) {
         if (!prog->error) prog->error = "InternalError: pattern exceeds maximum compiled instruction count";
-        return prog->code_count - 1;
+        return EMIT_NONE;
     }
     if (prog->code_count == prog->code_cap) {
         int new_cap = prog->code_cap ? prog->code_cap * 2 : 64;
         Instruction* grown = realloc(prog->code, sizeof(Instruction) * (size_t)new_cap);
         if (!grown) {
-            fprintf(stderr, "Fatal Error: Out of memory\n");
-            exit(EXIT_FAILURE);
+            if (!prog->error) prog->error = re_oom_error;
+            return EMIT_NONE;
         }
         prog->code = grown;
         prog->code_cap = new_cap;
@@ -63,6 +75,24 @@ static int emit(Program* prog, RegexOpCode op, int arg1, int arg2, int arg3, int
     int idx = prog->code_count++;
     prog->code[idx] = (Instruction){op, arg1, arg2, arg3, arg4, lazy};
     return idx;
+}
+
+/* Jump/split targets are only known after the branch's body has been
+ * emitted, so every one of them is backpatched into an instruction emit()
+ * returned earlier. Routing all of those writes through these keeps the
+ * whole compile walk safe once emit() has started failing, without each
+ * caller having to unwind: an EMIT_NONE (or any index past the code that
+ * actually exists) patches nothing. */
+static void patch_arg1(Program* prog, int pc, int target) {
+    if (pc >= 0 && pc < prog->code_count) prog->code[pc].arg1 = target;
+}
+
+static void patch_arg2(Program* prog, int pc, int target) {
+    if (pc >= 0 && pc < prog->code_count) prog->code[pc].arg2 = target;
+}
+
+static void patch_arg4(Program* prog, int pc, int target) {
+    if (pc >= 0 && pc < prog->code_count) prog->code[pc].arg4 = target;
 }
 
 /* A character class containing multi-codepoint string alternatives (from
@@ -97,8 +127,13 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
     int* jmp_pcs = malloc(sizeof(int) * (size_t)cls->string_count);
     StringOrder* order = malloc(sizeof(StringOrder) * (size_t)cls->string_count);
     if (!jmp_pcs || !order) {
-        fprintf(stderr, "Fatal Error: Out of memory\n");
-        exit(EXIT_FAILURE);
+        /* Emitting nothing for this class leaves the surrounding bytecode
+         * incoherent, which is fine and needs no unwinding: prog->error
+         * means nothing will ever execute it. */
+        if (!prog->error) prog->error = re_oom_error;
+        free(jmp_pcs);
+        free(order);
+        return;
     }
     int jmp_count = 0;
     /* Longest strings first: the spec's v-mode CharacterClass matcher
@@ -113,8 +148,8 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
     qsort(order, (size_t)cls->string_count, sizeof(StringOrder), string_order_cmp);
     for (int i = 0; i < cls->string_count; i++) {
         bool has_more = (i < cls->string_count - 1) || (cls->range_count > 0);
-        int split = has_more ? emit(prog, OP_SPLIT, 0, 0, 0, 0, false) : -1;
-        if (split != -1) prog->code[split].arg1 = prog->code_count;
+        int split = has_more ? emit(prog, OP_SPLIT, 0, 0, 0, 0, false) : EMIT_NONE;
+        patch_arg1(prog, split, prog->code_count);
         StringSequence* seq = &cls->strings[order[i].index];
         if (rtl) {
             for (int k = seq->length - 1; k >= 0; k--) emit(prog, OP_CHAR, emit_char_operand(prog, seq->cps[k]), prog->ignore_case, 0, 0, false);
@@ -123,12 +158,12 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
         }
         if (has_more) {
             jmp_pcs[jmp_count++] = emit(prog, OP_JMP, 0, 0, 0, 0, false);
-            prog->code[split].arg2 = prog->code_count;
+            patch_arg2(prog, split, prog->code_count);
         }
     }
     if (cls->range_count > 0) emit(prog, OP_CLASS, class_id, 0, 0, 0, false);
     int end_pc = prog->code_count;
-    for (int i = 0; i < jmp_count; i++) prog->code[jmp_pcs[i]].arg1 = end_pc;
+    for (int i = 0; i < jmp_count; i++) patch_arg1(prog, jmp_pcs[i], end_pc);
     free(jmp_pcs);
     free(order);
 }
@@ -231,8 +266,8 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             int jmp = emit(prog, OP_JMP, 0, 0, 0, 0, false);
             int la_start = prog->code_count;
             compile_node(node->left, prog, false);
-            emit(prog, OP_MATCH, 0, 0, 0, 0, false); 
-            prog->code[jmp].arg1 = prog->code_count; 
+            emit(prog, OP_MATCH, 0, 0, 0, 0, false);
+            patch_arg1(prog, jmp, prog->code_count);
             emit(prog, (node->type == AST_LOOKAHEAD) ? OP_LOOKAHEAD : OP_NEG_LOOKAHEAD, la_start, 0, 0, 0, false); break;
         }
         case AST_LOOKBEHIND:
@@ -240,18 +275,18 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             int jmp = emit(prog, OP_JMP, 0, 0, 0, 0, false);
             int lb_start = prog->code_count;
             compile_node(node->left, prog, true);
-            emit(prog, OP_MATCH, 0, 0, 0, 0, false); 
-            prog->code[jmp].arg1 = prog->code_count; 
+            emit(prog, OP_MATCH, 0, 0, 0, 0, false);
+            patch_arg1(prog, jmp, prog->code_count);
             emit(prog, (node->type == AST_LOOKBEHIND) ? OP_LOOKBEHIND : OP_NEG_LOOKBEHIND, lb_start, 0, 0, 0, false); break;
         }
         case AST_ALT: {
             int split = emit(prog, OP_SPLIT, 0, 0, 0, 0, false);
-            prog->code[split].arg1 = prog->code_count;
+            patch_arg1(prog, split, prog->code_count);
             compile_node(node->left, prog, rtl);
             int jmp = emit(prog, OP_JMP, 0, 0, 0, 0, false);
-            prog->code[split].arg2 = prog->code_count;
+            patch_arg2(prog, split, prog->code_count);
             compile_node(node->right, prog, rtl);
-            prog->code[jmp].arg1 = prog->code_count; break;
+            patch_arg1(prog, jmp, prog->code_count); break;
         }
         case AST_QUANTIFIER: {
             /* Bounds-checked against MAX_COUNTERS (a
@@ -260,9 +295,9 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
              * per-thread counters[MAX_COUNTERS]/counter_sp[MAX_COUNTERS]
              * arrays). No reserved-zero convention here (unlike group ids),
              * so counter_count >= MAX_COUNTERS is the exact overflow point;
-             * clamping to the last valid slot keeps this safe the same way
-             * emit()'s clamp does, for the same reason (prog->error set =>
-             * this Program is discarded, never executed). */
+             * clamping to the last valid slot is safe for the same reason
+             * every other limit here is (prog->error set => this Program is
+             * discarded, never executed). */
             int counter_id;
             if (prog->counter_count < MAX_COUNTERS) {
                 counter_id = prog->counter_count++;
@@ -289,7 +324,7 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             compile_node(node->left, prog, rtl);
             emit(prog, OP_INC_COUNTER, counter_id, 0, 0, 0, false);
             emit(prog, OP_JMP, split_pc, 0, 0, 0, false);
-            prog->code[check_idx].arg4 = prog->code_count; 
+            patch_arg4(prog, check_idx, prog->code_count);
             break;
         }
     }

@@ -27,7 +27,6 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -294,15 +293,22 @@ struct VMContext {
     uint64_t step_budget;
     uint64_t steps_used;
     bool budget_exhausted;
+    /* A match-time allocation failure. Reported through the same public
+     * accessor as budget exhaustion -- to a host both mean "the engine
+     * could not finish this match" -- but a SEPARATE flag because this one
+     * must survive vm_context_set_step_budget's re-arm, which clears
+     * budget_exhausted so one runaway subject doesn't poison later execs on
+     * a reused context. An OOM can leave a VMDepth half-initialized (some
+     * buffers allocated, so the lazy `if (!d->stack)` init won't rerun;
+     * others still NULL), and nothing repairs it -- so once this is set the
+     * context must never enter the VM again, re-arm or not. */
+    bool oom;
     VMDepth depth[MAX_AST_DEPTH];
 };
 
 VMContext* vm_context_new(const Program* prog) {
     VMContext* ctx = calloc(1, sizeof(VMContext));
-    if (!ctx) {
-        fprintf(stderr, "Fatal Error: Out of memory\n");
-        exit(EXIT_FAILURE);
-    }
+    if (!ctx) return NULL;
     ctx->cap_pairs = (prog->group_count + 1) * 2;
     return ctx;
 }
@@ -314,7 +320,7 @@ void vm_context_set_step_budget(VMContext* ctx, uint64_t max_steps) {
 }
 
 bool vm_context_budget_exhausted(const VMContext* ctx) {
-    return ctx->budget_exhausted;
+    return ctx->budget_exhausted || ctx->oom;
 }
 
 void vm_context_free(VMContext* ctx) {
@@ -343,26 +349,32 @@ void vm_context_free(VMContext* ctx) {
  * with the realloc and stays valid; it's only the slot->arena pointers
  * that need recomputing. The in-flight thread's captures live in their
  * own allocation, not the arena, precisely so growth never moves them.)
- * Returns false only at VM_STACK_MAX; allocation failure stays fatal,
- * matching the OOM policy everywhere else in this file. */
-static bool vm_grow_stack(VMDepth* d, int cap_pairs, int cc) {
+ * Returns false at VM_STACK_MAX and on allocation failure; the latter also
+ * sets ctx->oom, so the host hears "gave up" rather than "no match". Either
+ * way every buffer that DID grow is stored back into the VMDepth before
+ * returning, so nothing is leaked and the context stays freeable. */
+static bool vm_grow_stack(VMContext* ctx, VMDepth* d, int cap_pairs, int cc) {
     if (d->capacity >= VM_STACK_MAX) return false;
     int new_capacity = d->capacity * 2;
     Thread* new_stack = realloc(d->stack, sizeof(Thread) * (size_t)new_capacity);
+    if (new_stack) d->stack = new_stack;
     const uint16_t** new_arena = realloc((void*)d->arena, sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)new_capacity);
+    if (new_arena) d->arena = new_arena;
     if (!new_stack || !new_arena) {
-        fprintf(stderr, "Fatal Error: Out of memory\n");
-        exit(EXIT_FAILURE);
+        ctx->oom = true;
+        return false;
     }
     for (int i = 0; i < new_capacity; i++) new_stack[i].captures = new_arena + (size_t)i * cap_pairs;
     if (cc > 0) {
         /* Counter arenas grow (and rebase) in tandem, same discipline as
          * the captures arena above. */
         int* new_counters = realloc(d->counters_arena, sizeof(int) * (size_t)cc * (size_t)new_capacity);
+        if (new_counters) d->counters_arena = new_counters;
         const uint16_t** new_counter_sp = realloc((void*)d->counter_sp_arena, sizeof(uint16_t*) * (size_t)cc * (size_t)new_capacity);
+        if (new_counter_sp) d->counter_sp_arena = new_counter_sp;
         if (!new_counters || !new_counter_sp) {
-            fprintf(stderr, "Fatal Error: Out of memory\n");
-            exit(EXIT_FAILURE);
+            ctx->oom = true;
+            return false;
         }
         for (int i = 0; i < new_capacity; i++) {
             new_stack[i].counters = new_counters + (size_t)i * cc;
@@ -382,8 +394,10 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
     if (depth >= MAX_AST_DEPTH) return false; /* unreachable: the parser caps nesting */
     /* Sticky budget check: once exhausted, every further entry (the scan
      * loop's next start position, an outer thread retrying a lookaround)
-     * fails immediately instead of re-arming the counter. */
-    if (ctx->budget_exhausted) return false;
+     * fails immediately instead of re-arming the counter. ctx->oom is
+     * checked alongside it and is load-bearing for memory safety, not just
+     * for reporting -- see its declaration. */
+    if (ctx->budget_exhausted || ctx->oom) return false;
     VMDepth* d = &ctx->depth[depth];
     /* Memoizing failures is sound only when the cache key covers every bit
      * of thread state that can influence the future; captures aren't in the
@@ -409,13 +423,17 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
             if (!d->cache_counters || !d->cache_counter_sp || !d->counters_arena ||
                 !d->counter_sp_arena || !d->current_counters || !d->current_counter_sp ||
                 !d->path_counters || !d->path_counter_sp) {
-                fprintf(stderr, "Fatal Error: Out of memory\n");
-                exit(EXIT_FAILURE);
+                ctx->oom = true;
+                return false;
             }
         }
+        /* Whatever did get allocated stays on the VMDepth for
+         * vm_context_free to release; leaving this depth half-initialized
+         * is safe only because ctx->oom locks the context out of the VM for
+         * good, so no later entry can reach the buffers still NULL here. */
         if (!d->arena || !d->stack || !d->cache || !d->current_captures) {
-            fprintf(stderr, "Fatal Error: Out of memory\n");
-            exit(EXIT_FAILURE);
+            ctx->oom = true;
+            return false;
         }
         for (int i = 0; i < d->capacity; i++) {
             d->stack[i].captures = d->arena + (size_t)i * cap_pairs;
@@ -733,7 +751,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                  * abandons the whole match (see the define above). Growth
                  * reallocates through the VMDepth, so refresh the locals. */
                 if (stack_ptr == stack_capacity) {
-                    if (!vm_grow_stack(d, cap_pairs, cc)) return false;
+                    if (!vm_grow_stack(ctx, d, cap_pairs, cc)) return false;
                     stack = d->stack;
                     stack_capacity = d->capacity;
                 }
@@ -770,7 +788,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                     else if (max != -1 && c == max) current.pc = exit_pc;
                     else {
                         if (stack_ptr == stack_capacity) {
-                            if (!vm_grow_stack(d, cap_pairs, cc)) return false;
+                            if (!vm_grow_stack(ctx, d, cap_pairs, cc)) return false;
                             stack = d->stack;
                             stack_capacity = d->capacity;
                         }
@@ -819,6 +837,7 @@ bool vm_execute(Program* prog, VMContext* ctx, int start_pc, int step, const uin
 
 bool vm_execute_internal(Program* prog, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
     VMContext* ctx = vm_context_new(prog);
+    if (!ctx) return false;
     bool result = vm_run(prog, ctx, 0, start_pc, step, original_text, text_end, search_start, out_captures);
     vm_context_free(ctx);
     return result;
