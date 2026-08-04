@@ -28,7 +28,7 @@
  * not dereference the result, and (b) free any child they had already built
  * and were about to hand to it, since nothing else owns it. */
 static ASTNode* create_node(Lexer* lexer, ASTType type) {
-    ASTNode* node = calloc(1, sizeof(ASTNode));
+    ASTNode* node = re_calloc(&lexer->prog->alloc, 1, sizeof(ASTNode));
     if (!node) {
         if (!lexer->prog->error) lexer->prog->error = re_oom_error;
         return NULL;
@@ -171,7 +171,7 @@ static ASTNode* parse_primary(Lexer* lexer) {
         }
         /* The body was parsed before its wrapper could be allocated, and
          * nothing else references it. */
-        if (!node) { free_ast(inner); return NULL; }
+        if (!node) { free_ast(&lexer->prog->alloc, inner); return NULL; }
         node->left = inner;
         node = finish_node(lexer, node);
         if (is_capture) {
@@ -193,7 +193,7 @@ static ASTNode* parse_quantifier(Lexer* lexer) {
             lexer->prog->error = "SyntaxError: Invalid quantifier applied to assertion";
         }
         ASTNode* q = create_node(lexer, AST_QUANTIFIER);
-        if (!q) { free_ast(node); return NULL; }
+        if (!q) { free_ast(&lexer->prog->alloc, node); return NULL; }
         q->left = node;
         if (t == TOK_STAR)      { q->min = 0; q->max = -1; }
         else if (t == TOK_PLUS) { q->min = 1; q->max = -1; }
@@ -227,8 +227,8 @@ static ASTNode* build_balanced(Lexer* lexer, ASTType type, ASTNode** items, int 
     ASTNode* left = build_balanced(lexer, type, items, lo, mid);
     ASTNode* right = build_balanced(lexer, type, items, mid + 1, hi);
     if (!n) {
-        free_ast(left);
-        free_ast(right);
+        free_ast(&lexer->prog->alloc, left);
+        free_ast(&lexer->prog->alloc, right);
         return NULL;
     }
     n->left = left;
@@ -243,10 +243,10 @@ static ASTNode* build_balanced(Lexer* lexer, ASTType type, ASTNode** items, int 
 static ASTNode** items_push(Lexer* lexer, ASTNode** items, int* count, int* cap, ASTNode* node) {
     if (*count == *cap) {
         int new_cap = *cap * 2;
-        ASTNode** grown = realloc(items, sizeof(ASTNode*) * (size_t)new_cap);
+        ASTNode** grown = re_realloc(&lexer->prog->alloc, items, sizeof(ASTNode*) * (size_t)new_cap);
         if (!grown) {
             if (!lexer->prog->error) lexer->prog->error = re_oom_error;
-            free_ast(node);
+            free_ast(&lexer->prog->alloc, node);
             return items;
         }
         items = grown;
@@ -275,7 +275,7 @@ static ASTNode* parse_concat(Lexer* lexer) {
     ASTNode* node = parse_quantifier(lexer);
     if (!starts_atom(lexer->current.type)) return node;
     int cap = 8, count = 0;
-    ASTNode** items = malloc(sizeof(ASTNode*) * (size_t)cap);
+    ASTNode** items = re_alloc(&lexer->prog->alloc, sizeof(ASTNode*) * (size_t)cap);
     if (!items) {
         if (!lexer->prog->error) lexer->prog->error = re_oom_error;
         return node; /* the atom already parsed is still the caller's */
@@ -287,7 +287,7 @@ static ASTNode* parse_concat(Lexer* lexer) {
         items = items_push(lexer, items, &count, &cap, right);
     }
     node = build_balanced(lexer, AST_CONCAT, items, 0, count - 1);
-    free(items);
+    re_free(&lexer->prog->alloc, items);
     return node;
 }
 
@@ -318,7 +318,7 @@ ASTNode* parse_alt(Lexer* lexer) {
          * equal the alternative count. NULL items are legitimate: an empty
          * alternative (/a|/) has no concat node and matches empty. */
         int cap = 8, count = 0;
-        ASTNode** items = malloc(sizeof(ASTNode*) * (size_t)cap);
+        ASTNode** items = re_alloc(&lexer->prog->alloc, sizeof(ASTNode*) * (size_t)cap);
         if (!items) {
             if (!lexer->prog->error) lexer->prog->error = re_oom_error;
             lexer->parse_depth--;
@@ -330,7 +330,7 @@ ASTNode* parse_alt(Lexer* lexer) {
             items = items_push(lexer, items, &count, &cap, parse_concat(lexer));
         }
         node = build_balanced(lexer, AST_ALT, items, 0, count - 1);
-        free(items);
+        re_free(&lexer->prog->alloc, items);
     }
     lexer->parse_depth--;
     return node;
@@ -338,14 +338,14 @@ ASTNode* parse_alt(Lexer* lexer) {
 
 /* Non-static: called from re_compiler.c's compile_into. Declared in
  * re_internal.h. */
-void free_ast(ASTNode* node) {
+void free_ast(const RegexAllocator* a, ASTNode* node) {
     if (!node) return;
-    free_ast(node->left); free_ast(node->right); free(node);
+    free_ast(a, node->left); free_ast(a, node->right); re_free(a, node);
 }
 
 /* Non-static: called from re_compiler.c's compile_into. Declared in
  * re_internal.h. */
-bool validate_group_names(ASTNode* node, NameSet* out_set, const char** error) {
+bool validate_group_names(const RegexAllocator* a, ASTNode* node, NameSet* out_set, const char** error) {
     if (!node) return true;
     /* The two child NameSets are HEAP-allocated: as ~8KB stack locals they
      * made this the most stack-hungry recursion over the AST (observed
@@ -353,7 +353,7 @@ bool validate_group_names(ASTNode* node, NameSet* out_set, const char** error) {
      * forced MAX_AST_DEPTH down to 200 -- a depth real patterns hit
      * (test262 exercises 200 nested groups). With small frames here, the
      * depth cap could be raised; see MAX_AST_DEPTH in include/regexp.h. */
-    NameSet* sets = calloc(2, sizeof(NameSet));
+    NameSet* sets = re_calloc(a, 2, sizeof(NameSet));
     if (!sets) {
         if (!*error) *error = re_oom_error;
         return false; /* nothing allocated yet, so nothing to unwind */
@@ -361,8 +361,8 @@ bool validate_group_names(ASTNode* node, NameSet* out_set, const char** error) {
     NameSet* left_set = &sets[0];
     NameSet* right_set = &sets[1];
     bool ok = false;
-    if (!validate_group_names(node->left, left_set, error)) goto done;
-    if (!validate_group_names(node->right, right_set, error)) goto done;
+    if (!validate_group_names(a, node->left, left_set, error)) goto done;
+    if (!validate_group_names(a, node->right, right_set, error)) goto done;
 
     if (node->type == AST_ALT) {
         for (int i = 0; i < left_set->count; i++) {
@@ -402,6 +402,6 @@ bool validate_group_names(ASTNode* node, NameSet* out_set, const char** error) {
         ok = true;
     }
 done:
-    free(sets);
+    re_free(a, sets);
     return ok;
 }

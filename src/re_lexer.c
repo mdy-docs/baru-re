@@ -38,6 +38,25 @@
  * \p{...} prop_cache below. */
 static bool class_oom;
 
+/* A zeroed class bound to `a` (see CharClass.alloc in regexp.h). Every
+ * scratch class in this file is created through this rather than `= {0}`,
+ * because a class that silently kept a NULL handle would allocate its
+ * buffers from an embedder's allocator's *sibling* -- libc -- and be freed
+ * through the wrong one. Passing the handle of the class the scratch serves
+ * is what keeps a whole class-building call chain on one allocator. */
+static inline CharClass class_init(const RegexAllocator* a) {
+    CharClass c = {0};
+    c.alloc = a;
+    return c;
+}
+
+/* Re-zeroes a class for reuse. Same reason class_init exists: a bare
+ * memset over a CharClass drops its allocator handle. */
+static inline void class_reset(CharClass* cls, const RegexAllocator* a) {
+    memset(cls, 0, sizeof *cls);
+    cls->alloc = a;
+}
+
 static inline uint32_t decode_utf16_lexer(Lexer* lexer) {
     uint32_t cp = lexer->src[lexer->pos];
     /* Never advance past the NUL terminator: decoding "at end" returns 0
@@ -86,6 +105,7 @@ static int alloc_class(Program* prog) {
      * invariant self-contained rather than trusting the caller's reset. */
     class_free(&prog->classes[cid]);
     memset(&prog->classes[cid], 0, sizeof(CharClass)); /* slot is built in place */
+    prog->classes[cid].alloc = &prog->alloc;
     return cid;
 }
 
@@ -306,7 +326,7 @@ static bool parse_group_name(Lexer* lexer, char* out) {
 static void class_strings_push(CharClass* cls, const StringSequence* s) {
     if (cls->string_count == cls->string_cap) {
         int new_cap = cls->string_cap ? cls->string_cap * 2 : 16;
-        StringSequence* grown = realloc(cls->strings, sizeof(StringSequence) * (size_t)new_cap);
+        StringSequence* grown = re_realloc(cls->alloc, cls->strings, sizeof(StringSequence) * (size_t)new_cap);
         if (!grown) {
             class_oom = true;
             return;
@@ -318,7 +338,7 @@ static void class_strings_push(CharClass* cls, const StringSequence* s) {
 }
 
 static void class_strings_free(CharClass* cls) {
-    free(cls->strings);
+    re_free(cls->alloc, cls->strings);
     cls->strings = NULL;
     cls->string_count = 0;
     cls->string_cap = 0;
@@ -331,7 +351,7 @@ static void class_strings_free(CharClass* cls) {
  * "just return" now leaks where the old embedded array did not). */
 void class_free(CharClass* cls) {
     class_strings_free(cls);
-    free(cls->ranges);
+    re_free(cls->alloc, cls->ranges);
     cls->ranges = NULL;
     cls->range_count = 0;
     cls->range_cap = 0;
@@ -341,7 +361,7 @@ static bool ranges_reserve(CharClass* cls, int need) {
     if (need <= cls->range_cap) return true;
     int new_cap = cls->range_cap ? cls->range_cap * 2 : 16;
     while (new_cap < need) new_cap *= 2;
-    CodePointRange* grown = realloc(cls->ranges, sizeof(CodePointRange) * (size_t)new_cap);
+    CodePointRange* grown = re_realloc(cls->alloc, cls->ranges, sizeof(CodePointRange) * (size_t)new_cap);
     if (!grown) {
         class_oom = true;
         return false;
@@ -450,7 +470,7 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode, bool fol
             add_range(cls, spaces[i], spaces[i+1]);
         }
     } else { /* 'D', 'W', 'S': fold-close the positive set, then complement */
-        CharClass temp = {0};
+        CharClass temp = class_init(cls->alloc);
         /* fold_case=false here: the single closure below covers all three
          * positive sets (passing it through used to fold-close 'w' twice --
          * once inside the recursive fill, once below). */
@@ -486,7 +506,15 @@ static void fill_builtin_class(CharClass* cls, char type, bool unicode, bool fol
 /* The cached CharClass carries RANGES only (its strings stay NULL): string
  * sequences are re-copied from the immutable generated table (via `prop`)
  * on every use instead, so the cache never owns heap string buffers and
- * CharClass's ownership rules don't extend into process-lifetime statics. */
+ * CharClass's ownership rules don't extend into process-lifetime statics.
+ *
+ * Its range buffers are always libc's (cls.alloc stays NULL), never an
+ * embedder's: an entry outlives the Program that populated it and is read
+ * by every later compile, so charging it to one host heap would leave that
+ * heap's accounting short by a block it can never free, and the entry
+ * dangling if the host tore that heap down. The bound is what it always
+ * was -- at most MAX_PROP_CACHE distinct properties' worth of ranges, from
+ * a fixed generated table, for the life of the process. */
 static struct {
     int kind;
     char name[MAX_PROP_NAME];
@@ -548,7 +576,13 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
     /* Range build target only when the cache is full -- its heap ranges
      * must be freed before every return below (uncached_local tracks
      * whether `local` is the live build; a cached build's buffer belongs
-     * to the process-lifetime cache instead). */
+     * to the process-lifetime cache instead).
+     *
+     * Deliberately libc-allocated (no class_init), like the cache slot it
+     * stands in for: this is the same build, on the same fixed table data,
+     * that would have been cached had a slot been free, and the two must
+     * not differ in which heap they draw from. It is released before every
+     * return, so it charges nothing anywhere. */
     CharClass local = {0};
     bool uncached_local = false;
     if (!src) {
@@ -561,7 +595,8 @@ static bool fill_unicode_property(CharClass* cls, const char* key, const char* n
         if (!ucd_prop) return false;
         CharClass* build = (prop_cache_count < MAX_PROP_CACHE) ? &prop_cache[prop_cache_count].cls : &local;
         uncached_local = (build == &local);
-        memset(build, 0, sizeof(CharClass));
+        memset(build, 0, sizeof(CharClass)); /* clears .alloc to libc, as both
+                                              * targets require -- see above */
         for (int i = 0; i < ucd_prop->count; i++) {
             add_range(build, ucd_prop->ranges[i].start, ucd_prop->ranges[i].end);
         }
@@ -681,7 +716,7 @@ static void apply_case_folding(CharClass* cls, bool unicode) {
 }
 
 static void invert_class(CharClass* cls) {
-    CharClass res = {0};
+    CharClass res = class_init(cls->alloc);
     uint32_t current = 0;
     for (int i = 0; i < cls->range_count; i++) {
         if (cls->ranges[i].start > current) {
@@ -746,7 +781,7 @@ static void class_union_v(CharClass* dst, const CharClass* src) {
  * assignment after a's own buffer is freed -- the one sanctioned
  * ownership-transfer idiom (see CharClass in regexp.h). */
 static void class_intersect_v(CharClass* a, const CharClass* b) {
-    CharClass res = {0};
+    CharClass res = class_init(a->alloc);
     for (int i = 0; i < a->range_count; i++) {
         for (int j = 0; j < b->range_count; j++) {
             uint32_t start = a->ranges[i].start > b->ranges[j].start ? a->ranges[i].start : b->ranges[j].start;
@@ -761,10 +796,10 @@ static void class_intersect_v(CharClass* a, const CharClass* b) {
 }
 
 static void class_subtract_v(CharClass* a, const CharClass* b) {
-    CharClass binv = {0};
+    CharClass binv = class_init(a->alloc);
     for (int i = 0; i < b->range_count; i++) add_range(&binv, b->ranges[i].start, b->ranges[i].end);
     invert_class(&binv);
-    CharClass res = {0};
+    CharClass res = class_init(a->alloc);
     for (int i = 0; i < a->range_count; i++) {
         for (int j = 0; j < binv.range_count; j++) {
             uint32_t start = a->ranges[i].start > binv.ranges[j].start ? a->ranges[i].start : binv.ranges[j].start;
@@ -852,7 +887,7 @@ static void parse_char_class(Lexer* lexer, CharClass* cls) {
     bool negate = false;
     if (lexer->src[lexer->pos] == '^') { negate = true; lexer->pos++; }
 
-    CharClass current_union = {0};
+    CharClass current_union = class_init(cls->alloc);
 
     while (lexer->src[lexer->pos] != ']' && lexer->src[lexer->pos] != '\0') {
         {
@@ -1327,7 +1362,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
      * ~16KB CharClass happened to keep its pointer fields in
      * fresh-mapped-zero territory in practice; the right-sized struct
      * made the garbage-free reachable, fuzzer-found.) */
-    CharClass* tmp = calloc(1, sizeof(CharClass));
+    CharClass* tmp = re_calloc(&lexer->prog->alloc, 1, sizeof(CharClass));
     if (!tmp) {
         /* A Lexer is in hand here, so report directly rather than through
          * class_oom -- it stops the enclosing parse immediately. */
@@ -1338,7 +1373,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
 
     if (lexer->src[lexer->pos] != ']' && lexer->src[lexer->pos] != '\0') {
         bool single = false;
-        memset(tmp, 0, sizeof(CharClass));
+        class_reset(tmp, &lexer->prog->alloc);
         parse_class_v_element(lexer, tmp, &single);
         if (!lexer->prog->error) {
             class_union_v(cls, tmp);
@@ -1353,7 +1388,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
                 while (!lexer->prog->error && lexer->src[lexer->pos] == o0 && lexer->src[lexer->pos + 1] == o0) {
                     lexer->pos += 2;
                     class_free(tmp);
-                    memset(tmp, 0, sizeof(CharClass));
+                    class_reset(tmp, &lexer->prog->alloc);
                     uint32_t ch = 0;
                     if (!parse_class_set_operand(lexer, tmp, &ch)) {
                         add_range(tmp, ch, ch);
@@ -1377,7 +1412,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
                         break;
                     }
                     class_free(tmp);
-                    memset(tmp, 0, sizeof(CharClass));
+                    class_reset(tmp, &lexer->prog->alloc);
                     parse_class_v_element(lexer, tmp, &single);
                     if (lexer->prog->error) break;
                     class_union_v(cls, tmp);
@@ -1386,7 +1421,7 @@ static void parse_char_class_v(Lexer* lexer, CharClass* cls) {
         }
     }
     class_free(tmp);
-    free(tmp);
+    re_free(&lexer->prog->alloc, tmp);
     if (lexer->prog->error) { lexer->parse_depth--; return; }
 
     if (lexer->src[lexer->pos] == ']') {

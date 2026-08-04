@@ -64,7 +64,7 @@ static int emit(Program* prog, RegexOpCode op, int arg1, int arg2, int arg3, int
     }
     if (prog->code_count == prog->code_cap) {
         int new_cap = prog->code_cap ? prog->code_cap * 2 : 64;
-        Instruction* grown = realloc(prog->code, sizeof(Instruction) * (size_t)new_cap);
+        Instruction* grown = re_realloc(&prog->alloc, prog->code, sizeof(Instruction) * (size_t)new_cap);
         if (!grown) {
             if (!prog->error) prog->error = re_oom_error;
             return EMIT_NONE;
@@ -124,15 +124,15 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
     /* Heap scratch sized to the actual string count -- these were fixed
      * [128] arrays back when the string set itself was capped at 128;
      * a full \p{RGI_Emoji} is 2604 alternatives now. */
-    int* jmp_pcs = malloc(sizeof(int) * (size_t)cls->string_count);
-    StringOrder* order = malloc(sizeof(StringOrder) * (size_t)cls->string_count);
+    int* jmp_pcs = re_alloc(&prog->alloc, sizeof(int) * (size_t)cls->string_count);
+    StringOrder* order = re_alloc(&prog->alloc, sizeof(StringOrder) * (size_t)cls->string_count);
     if (!jmp_pcs || !order) {
         /* Emitting nothing for this class leaves the surrounding bytecode
          * incoherent, which is fine and needs no unwinding: prog->error
          * means nothing will ever execute it. */
         if (!prog->error) prog->error = re_oom_error;
-        free(jmp_pcs);
-        free(order);
+        re_free(&prog->alloc, jmp_pcs);
+        re_free(&prog->alloc, order);
         return;
     }
     int jmp_count = 0;
@@ -164,8 +164,8 @@ static void compile_class_with_strings(Program* prog, int class_id, bool rtl) {
     if (cls->range_count > 0) emit(prog, OP_CLASS, class_id, 0, 0, 0, false);
     int end_pc = prog->code_count;
     for (int i = 0; i < jmp_count; i++) patch_arg1(prog, jmp_pcs[i], end_pc);
-    free(jmp_pcs);
-    free(order);
+    re_free(&prog->alloc, jmp_pcs);
+    re_free(&prog->alloc, order);
 }
 
 /* Smallest and largest capture-group id *defined* inside this subtree --
@@ -436,9 +436,9 @@ static void scan_add_class(Program* prog, const CharClass* cls) {
  * backreference, or a lookaround. Each pc is visited once; a SPLIT pushes
  * two successors, so the worklist is bounded by 2*code_count. */
 static void compute_scan_filter(Program* prog) {
-    bool* visited = calloc((size_t)prog->code_count, sizeof(bool));
-    int* work = malloc(sizeof(int) * (2 * (size_t)prog->code_count + 1));
-    if (!visited || !work) { free(visited); free(work); return; } /* no filter; not fatal */
+    bool* visited = re_calloc(&prog->alloc, (size_t)prog->code_count, sizeof(bool));
+    int* work = re_alloc(&prog->alloc, sizeof(int) * (2 * (size_t)prog->code_count + 1));
+    if (!visited || !work) { re_free(&prog->alloc, visited); re_free(&prog->alloc, work); return; } /* no filter; not fatal */
     int wp = 0;
     bool ok = prog->code_count > 0;
     work[wp++] = 0;
@@ -461,8 +461,8 @@ static void compute_scan_filter(Program* prog) {
             default: ok = false; break; /* OP_MATCH, backrefs, lookaround */
         }
     }
-    free(visited);
-    free(work);
+    re_free(&prog->alloc, visited);
+    re_free(&prog->alloc, work);
     prog->scan_filter = ok;
 }
 
@@ -470,10 +470,18 @@ static void compute_scan_filter(Program* prog) {
  * Program a host is done with. Distinct from compile_into's re-entry
  * reset, which frees the classes' buffers (their counts restart at zero)
  * but deliberately KEEPS the code buffer for reuse across recompiles. */
+/* Non-static, public (declared in regexp.h). Deliberately touches nothing
+ * but the handle: it is called on a zero-initialized Program, before any
+ * buffer exists for the previous allocator to still own. */
+void program_set_allocator(Program* prog, RegexReallocFn fn, void* userdata) {
+    prog->alloc.fn = fn;
+    prog->alloc.ud = userdata;
+}
+
 void program_release(Program* prog) {
     for (int i = 0; i < prog->class_count; i++) class_free(&prog->classes[i]);
     prog->class_count = 0;
-    free(prog->code);
+    re_free(&prog->alloc, prog->code);
     prog->code = NULL;
     prog->code_count = 0;
     prog->code_cap = 0;
@@ -525,7 +533,7 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
 
     if (!prog->error) {
         NameSet set = {0};
-        validate_group_names(ast, &set, &prog->error);
+        validate_group_names(&prog->alloc, ast, &set, &prog->error);
     }
 
     if (!prog->error) {
@@ -563,5 +571,5 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
         emit(prog, OP_MATCH, 0, 0, 0, 0, false);
     }
     if (!prog->error) compute_scan_filter(prog);
-    free_ast(ast);
+    free_ast(&prog->alloc, ast);
 }

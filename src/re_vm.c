@@ -32,6 +32,7 @@
 
 #include "ucd.h"
 #include "regexp.h"
+#include "re_internal.h"
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
@@ -303,13 +304,19 @@ struct VMContext {
      * others still NULL), and nothing repairs it -- so once this is set the
      * context must never enter the VM again, re-arm or not. */
     bool oom;
+    /* Copied from the Program at creation, not borrowed by pointer: a
+     * context outlives no Program in practice, but a copy costs two words
+     * and removes the question entirely. Every buffer below is allocated
+     * and freed through it. */
+    RegexAllocator alloc;
     VMDepth depth[MAX_AST_DEPTH];
 };
 
 VMContext* vm_context_new(const Program* prog) {
-    VMContext* ctx = calloc(1, sizeof(VMContext));
+    VMContext* ctx = re_calloc(&prog->alloc, 1, sizeof(VMContext));
     if (!ctx) return NULL;
     ctx->cap_pairs = (prog->group_count + 1) * 2;
+    ctx->alloc = prog->alloc;
     return ctx;
 }
 
@@ -325,21 +332,24 @@ bool vm_context_budget_exhausted(const VMContext* ctx) {
 
 void vm_context_free(VMContext* ctx) {
     if (!ctx) return;
+    /* By value: the last re_free below releases the struct this handle
+     * lives in. */
+    const RegexAllocator a = ctx->alloc;
     for (int i = 0; i < MAX_AST_DEPTH; i++) {
-        free(ctx->depth[i].stack);
-        free((void*)ctx->depth[i].arena);
-        free((void*)ctx->depth[i].current_captures);
-        free(ctx->depth[i].counters_arena);
-        free((void*)ctx->depth[i].counter_sp_arena);
-        free(ctx->depth[i].current_counters);
-        free((void*)ctx->depth[i].current_counter_sp);
-        free(ctx->depth[i].path_counters);
-        free((void*)ctx->depth[i].path_counter_sp);
-        free(ctx->depth[i].cache);
-        free(ctx->depth[i].cache_counters);
-        free((void*)ctx->depth[i].cache_counter_sp);
+        re_free(&a, ctx->depth[i].stack);
+        re_free(&a, (void*)ctx->depth[i].arena);
+        re_free(&a, (void*)ctx->depth[i].current_captures);
+        re_free(&a, ctx->depth[i].counters_arena);
+        re_free(&a, (void*)ctx->depth[i].counter_sp_arena);
+        re_free(&a, ctx->depth[i].current_counters);
+        re_free(&a, (void*)ctx->depth[i].current_counter_sp);
+        re_free(&a, ctx->depth[i].path_counters);
+        re_free(&a, (void*)ctx->depth[i].path_counter_sp);
+        re_free(&a, ctx->depth[i].cache);
+        re_free(&a, ctx->depth[i].cache_counters);
+        re_free(&a, (void*)ctx->depth[i].cache_counter_sp);
     }
-    free(ctx);
+    re_free(&a, ctx);
 }
 
 /* Doubles the backtrack stack and its captures arena in tandem. Every
@@ -356,9 +366,9 @@ void vm_context_free(VMContext* ctx) {
 static bool vm_grow_stack(VMContext* ctx, VMDepth* d, int cap_pairs, int cc) {
     if (d->capacity >= VM_STACK_MAX) return false;
     int new_capacity = d->capacity * 2;
-    Thread* new_stack = realloc(d->stack, sizeof(Thread) * (size_t)new_capacity);
+    Thread* new_stack = re_realloc(&ctx->alloc, d->stack, sizeof(Thread) * (size_t)new_capacity);
     if (new_stack) d->stack = new_stack;
-    const uint16_t** new_arena = realloc((void*)d->arena, sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)new_capacity);
+    const uint16_t** new_arena = re_realloc(&ctx->alloc, (void*)d->arena, sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)new_capacity);
     if (new_arena) d->arena = new_arena;
     if (!new_stack || !new_arena) {
         ctx->oom = true;
@@ -368,9 +378,9 @@ static bool vm_grow_stack(VMContext* ctx, VMDepth* d, int cap_pairs, int cc) {
     if (cc > 0) {
         /* Counter arenas grow (and rebase) in tandem, same discipline as
          * the captures arena above. */
-        int* new_counters = realloc(d->counters_arena, sizeof(int) * (size_t)cc * (size_t)new_capacity);
+        int* new_counters = re_realloc(&ctx->alloc, d->counters_arena, sizeof(int) * (size_t)cc * (size_t)new_capacity);
         if (new_counters) d->counters_arena = new_counters;
-        const uint16_t** new_counter_sp = realloc((void*)d->counter_sp_arena, sizeof(uint16_t*) * (size_t)cc * (size_t)new_capacity);
+        const uint16_t** new_counter_sp = re_realloc(&ctx->alloc, (void*)d->counter_sp_arena, sizeof(uint16_t*) * (size_t)cc * (size_t)new_capacity);
         if (new_counter_sp) d->counter_sp_arena = new_counter_sp;
         if (!new_counters || !new_counter_sp) {
             ctx->oom = true;
@@ -407,19 +417,19 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
     const int cc = prog->counter_count;
     if (!d->stack) {
         d->capacity = VM_STACK_CAPACITY;
-        d->arena = malloc(sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)d->capacity);
-        d->stack = malloc(sizeof(Thread) * (size_t)d->capacity);
-        d->cache = malloc(sizeof(CacheEntry) * CACHE_SIZE);
-        d->current_captures = malloc(sizeof(uint16_t*) * (size_t)cap_pairs);
+        d->arena = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)d->capacity);
+        d->stack = re_alloc(&ctx->alloc, sizeof(Thread) * (size_t)d->capacity);
+        d->cache = re_alloc(&ctx->alloc, sizeof(CacheEntry) * CACHE_SIZE);
+        d->current_captures = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cap_pairs);
         if (cc > 0) {
-            d->cache_counters = malloc(sizeof(int) * (size_t)cc * CACHE_SIZE);
-            d->cache_counter_sp = malloc(sizeof(uint16_t*) * (size_t)cc * CACHE_SIZE);
-            d->counters_arena = malloc(sizeof(int) * (size_t)cc * (size_t)d->capacity);
-            d->counter_sp_arena = malloc(sizeof(uint16_t*) * (size_t)cc * (size_t)d->capacity);
-            d->current_counters = malloc(sizeof(int) * (size_t)cc);
-            d->current_counter_sp = malloc(sizeof(uint16_t*) * (size_t)cc);
-            d->path_counters = malloc(sizeof(int) * (size_t)cc);
-            d->path_counter_sp = malloc(sizeof(uint16_t*) * (size_t)cc);
+            d->cache_counters = re_alloc(&ctx->alloc, sizeof(int) * (size_t)cc * CACHE_SIZE);
+            d->cache_counter_sp = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cc * CACHE_SIZE);
+            d->counters_arena = re_alloc(&ctx->alloc, sizeof(int) * (size_t)cc * (size_t)d->capacity);
+            d->counter_sp_arena = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cc * (size_t)d->capacity);
+            d->current_counters = re_alloc(&ctx->alloc, sizeof(int) * (size_t)cc);
+            d->current_counter_sp = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cc);
+            d->path_counters = re_alloc(&ctx->alloc, sizeof(int) * (size_t)cc);
+            d->path_counter_sp = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cc);
             if (!d->cache_counters || !d->cache_counter_sp || !d->counters_arena ||
                 !d->counter_sp_arena || !d->current_counters || !d->current_counter_sp ||
                 !d->path_counters || !d->path_counter_sp) {

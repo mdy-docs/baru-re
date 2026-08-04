@@ -13,8 +13,43 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "regexp.h"
+
+/* ---- Allocation ----------------------------------------------------------
+ * Every allocation in src/ goes through these four rather than calling libc
+ * directly, so an embedder-supplied allocator (RegexAllocator, regexp.h) sees
+ * all of it. `a` may be NULL, and so may a->fn; either means libc, which is
+ * what keeps the standalone library and its test suite allocator-free. */
+
+static inline bool re_has_alloc(const RegexAllocator* a) { return a && a->fn; }
+
+static inline void* re_alloc(const RegexAllocator* a, size_t size) {
+    return re_has_alloc(a) ? a->fn(a->ud, NULL, size) : malloc(size);
+}
+
+/* Failure leaves the original block untouched, exactly like realloc. */
+static inline void* re_realloc(const RegexAllocator* a, void* ptr, size_t size) {
+    return re_has_alloc(a) ? a->fn(a->ud, ptr, size) : realloc(ptr, size);
+}
+
+static inline void re_free(const RegexAllocator* a, void* ptr) {
+    if (!ptr) return;
+    if (re_has_alloc(a)) a->fn(a->ud, ptr, 0);
+    else free(ptr);
+}
+
+/* calloc's overflow check has to be reproduced here: the injectable hook is
+ * a single-size-argument interface, so n*size is computed on this side. */
+static inline void* re_calloc(const RegexAllocator* a, size_t n, size_t size) {
+    if (!re_has_alloc(a)) return calloc(n, size);
+    if (n && size > (size_t)-1 / n) return NULL;
+    void* p = a->fn(a->ud, NULL, n * size);
+    if (p) memset(p, 0, n * size);
+    return p;
+}
 
 /* The single message every COMPILE-TIME allocation failure reports through
  * (assigned to Program.error, whose contents are always static literals).
@@ -117,13 +152,17 @@ uint32_t annexb_canonicalize(uint32_t ch);
 ASTNode* parse_alt(Lexer* lexer);
 
 /* Frees an AST built by parse_alt. Called from re_compiler.c's compile_into
- * once it's done compiling the tree to bytecode. */
-void free_ast(ASTNode* node);
+ * once it's done compiling the tree to bytecode. The allocator is a
+ * parameter rather than a field on ASTNode: unlike CharClass, every one of
+ * this function's few call sites already holds a Lexer or a Program, so the
+ * compiler can check them instead of every node paying for a handle. */
+void free_ast(const RegexAllocator* a, ASTNode* node);
 
 /* Collects every capture group name into out_set, rejecting duplicates
  * within the same alternative (duplicates across mutually-exclusive
  * alternation branches are allowed, per ES2025). Called from re_compiler.c's
  * compile_into as a post-parse validation pass. */
-bool validate_group_names(ASTNode* node, NameSet* out_set, const char** error);
+bool validate_group_names(const RegexAllocator* a, ASTNode* node, NameSet* out_set,
+                          const char** error);
 
 #endif /* RE_INTERNAL_H */

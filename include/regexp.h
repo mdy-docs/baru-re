@@ -2,6 +2,7 @@
 #define REGEXP_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* 32768, not the original 16384: string-set classes compile to one
@@ -63,6 +64,40 @@
 #define REGEX_FLAG_INDICES 64
 #define REGEX_FLAG_UNICODE_SETS 128
 
+/* ---- Injectable allocator ------------------------------------------------
+ *
+ * Every byte this engine allocates -- compiled bytecode, parser AST nodes,
+ * character-class range/string buffers, the per-match VMContext and its
+ * per-depth thread arenas -- goes through one of these, so an embedder that
+ * meters or caps its own heap can meter and cap the regex engine too. A host
+ * that supplies none gets plain libc malloc/realloc/free, which is what the
+ * standalone library, its smoke suite and its fuzzer all run on.
+ *
+ * The handle is carried per-Program (program_set_allocator) and per-VMContext
+ * (inherited from the Program it is created for), never in a global: a host
+ * with several independent heaps -- one per sandboxed guest, say -- must be
+ * able to charge each pattern to the heap that owns it, and a process-wide
+ * hook would misattribute the moment two of them are live at once.
+ *
+ * One realloc-shaped entry point covers all three operations:
+ *   ptr == NULL     -> allocate new_size bytes (never called with 0)
+ *   new_size == 0   -> free ptr, return NULL
+ *   otherwise       -> resize ptr to new_size, NULL on failure (ptr survives)
+ * The OLD size is deliberately not passed: no call site in this engine tracks
+ * one for its malloc-shaped allocations, so an allocator that needs the old
+ * size (to maintain a live-byte total by delta, say) must record it itself --
+ * a size header in front of each block is the usual way.
+ *
+ * A NULL return is never fatal here: compile-time failures surface through
+ * Program.error and match-time ones through vm_context_budget_exhausted (see
+ * both below). The allocator must not longjmp or exit. */
+typedef void* (*RegexReallocFn)(void* userdata, void* ptr, size_t new_size);
+
+typedef struct {
+    RegexReallocFn fn; /* NULL = libc malloc/realloc/free */
+    void* ud;
+} RegexAllocator;
+
 /* The enum members ARE the short names: every use site already said OP_*
  * (via a full set of aliasing macros this header used to carry); the
  * REGEX_OP_* spellings were referenced nowhere else in this repo or by
@@ -112,6 +147,17 @@ typedef struct {
     int string_count;
     int string_cap;
     bool negated;
+    /* Which allocator owns the two buffers above (NULL = libc). A class is
+     * reached through neither a Program nor a Lexer at most of its ~140
+     * construction and teardown sites -- set-algebra temporaries, builtin
+     * fills, the \p{...} cache -- so the handle rides on the class itself
+     * rather than being threaded through all of them. It must be set before
+     * the first buffer is allocated and must not change while any is live:
+     * every grow and every free reads it back from here, so a class whose
+     * handle changed mid-life would be freed by an allocator other than the
+     * one that produced its memory. Copies made by the ownership-transfer
+     * idiom carry it along like the pointers it describes. */
+    const RegexAllocator* alloc;
 } CharClass;
 
 /* code is heap-owned and right-sized: emit() (re_compiler.c) grows it on
@@ -167,6 +213,11 @@ typedef struct {
     bool scan_non_ascii;
     uint8_t scan_ascii[16];
     const char* error;
+    /* Allocator for everything this Program owns, and the one a VMContext
+     * created for it inherits. Zero (libc) unless program_set_allocator was
+     * called; compile_into and program_release both preserve it, so it
+     * survives recompiles and outlives every buffer it produced. */
+    RegexAllocator alloc;
 } Program;
 
 typedef struct {
@@ -175,6 +226,14 @@ typedef struct {
 } CaptureIndex;
 
 void compile_into(Program* prog, const uint16_t* regex, int flags);
+
+/* Routes every allocation this Program (and any VMContext created for it)
+ * makes through fn/userdata instead of libc. Call on a ZERO-INITIALIZED
+ * Program before its first compile_into: the handle is read back at every
+ * grow and every free, so switching it while buffers are live would free
+ * that memory through the wrong allocator. Passing fn == NULL restores the
+ * libc default. */
+void program_set_allocator(Program* prog, RegexReallocFn fn, void* userdata);
 
 /* Releases one class's heap-owned buffers, ranges and strings both (safe
  * on an empty class; the pointers are NULLed). */
@@ -198,7 +257,9 @@ void program_release(Program* prog);
 typedef struct VMContext VMContext;
 /* NULL if the context could not be allocated. A caller that treats that as
  * "no match" reports a wrong answer; treat it like budget exhaustion below
- * -- the match could not be evaluated. */
+ * -- the match could not be evaluated. The context is allocated with, and
+ * itself allocates through, prog's allocator, so the pattern and the memory
+ * spent matching it are charged to the same place. */
 VMContext* vm_context_new(const Program* prog);
 void vm_context_free(VMContext* ctx);
 
