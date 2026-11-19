@@ -1324,7 +1324,35 @@ int main(void) {
         uint16_t just_a = 'a';
         check(!vm_execute(prog, c3, 0, 1, &just_a, &just_a + 1, &just_a, caps),
               "an exhausted context refuses further matches");
+        check(vm_context_steps_used(c3) > 5 * 1000 * 1000 && !vm_context_interrupted(c3),
+              "steps_used reports the spent budget; exhaustion is not an interrupt");
+        /* re-armed, a small match reports the few steps it spent */
         vm_context_free(c3);
+        VMContext* c5 = vm_context_new(prog);
+        vm_context_set_step_budget(c5, 1000);
+        uint16_t aa[2] = {'a', 'a'};
+        check(vm_execute(prog, c5, 0, 1, aa, aa + 2, aa, caps) &&
+              vm_context_steps_used(c5) > 0 && vm_context_steps_used(c5) < 1000,
+              "steps_used counts a successful match's steps");
+        vm_context_free(c5);
+
+        /* the interrupt flag stops the ReDoS case long before its budget, and says so */
+        volatile int stop = 1;
+        VMContext* c4 = vm_context_new(prog);
+        vm_context_set_step_budget(c4, 1000ull * 1000 * 1000 * 1000);
+        vm_context_set_interrupt(c4, &stop);
+        matched = false;
+        for (int i = 0; i < n && !matched; i++)
+            matched = vm_execute(prog, c4, 0, 1, text, text + n, text + i, caps);
+        check(!matched && vm_context_budget_exhausted(c4) && vm_context_interrupted(c4) &&
+              vm_context_steps_used(c4) <= 4096,
+              "a set interrupt flag abandons the match within 4096 steps");
+        /* re-arming clears the interrupted state; a clear flag polls as nothing */
+        stop = 0;
+        vm_context_set_step_budget(c4, 1000);
+        check(!vm_context_interrupted(c4) && !vm_context_budget_exhausted(c4),
+              "re-arming clears the interrupted state");
+        vm_context_free(c4);
 
         program_release(prog);
         free(prog);

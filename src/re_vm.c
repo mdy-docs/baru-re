@@ -294,6 +294,10 @@ struct VMContext {
     uint64_t step_budget;
     uint64_t steps_used;
     bool budget_exhausted;
+    /* The host's interrupt flag (vm_context_set_interrupt), polled every 4096 counted steps, and
+     * whether reading it set is what exhausted the budget */
+    const volatile int* interrupt;
+    bool interrupted;
     /* A match-time allocation failure. Reported through the same public
      * accessor as budget exhaustion -- to a host both mean "the engine
      * could not finish this match" -- but a SEPARATE flag because this one
@@ -324,6 +328,19 @@ void vm_context_set_step_budget(VMContext* ctx, uint64_t max_steps) {
     ctx->step_budget = max_steps;
     ctx->steps_used = 0;
     ctx->budget_exhausted = false;
+    ctx->interrupted = false;
+}
+
+uint64_t vm_context_steps_used(const VMContext* ctx) {
+    return ctx->steps_used;
+}
+
+void vm_context_set_interrupt(VMContext* ctx, const volatile int* flag) {
+    ctx->interrupt = flag;
+}
+
+bool vm_context_interrupted(const VMContext* ctx) {
+    return ctx->interrupted;
 }
 
 bool vm_context_budget_exhausted(const VMContext* ctx) {
@@ -509,9 +526,15 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
              * safe for the same reason the VM_STACK_MAX abandon is: all
              * scratch is context-owned and (re)initialized per entry, so a
              * plain return leaves the context reusable. */
-            if (ctx->step_budget && ++ctx->steps_used > ctx->step_budget) {
-                ctx->budget_exhausted = true;
-                return false;
+            if (ctx->step_budget) {
+                if (++ctx->steps_used > ctx->step_budget) {
+                    ctx->budget_exhausted = true;
+                    return false;
+                }
+                if (!(ctx->steps_used & 4095) && ctx->interrupt && *ctx->interrupt) {
+                    ctx->budget_exhausted = ctx->interrupted = true;
+                    return false;
+                }
             }
             Instruction inst = prog->code[current.pc];
             /* A dense switch over the opcode enum compiles to a jump table

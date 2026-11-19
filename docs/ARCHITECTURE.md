@@ -422,7 +422,11 @@ typedef struct {
   match exactly like the `VM_STACK_MAX` abandon (plain `return false`; all
   scratch is context-owned, so the context stays coherent), sets a sticky
   flag readable via `vm_context_budget_exhausted`, and every subsequent
-  `vm_run` entry on that context fails immediately. Default is 0 =
+  `vm_run` entry on that context fails immediately. `vm_context_steps_used`
+  reads the count back. An optional host interrupt flag
+  (`vm_context_set_interrupt`) is read where steps are counted, every 4096
+  of them, and abandons the match the same way, with
+  `vm_context_interrupted` set. Default is 0 =
   unlimited — behavior is unchanged for consumers that don't opt in
   (including, currently, the `regex_wasm.c` shim's `regex_exec`).
 - Opcode dispatch is a dense `switch` over the opcode enum

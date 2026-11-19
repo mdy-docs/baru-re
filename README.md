@@ -175,7 +175,11 @@ Notes:
   unlimited, which is the default. Native embedders driving the engine API
   directly get the same via `vm_context_set_step_budget` /
   `vm_context_budget_exhausted` on their `VMContext` — see the comment in
-  `include/regexp.h` for sizing guidance.
+  `include/regexp.h` for sizing guidance. `vm_context_steps_used` reports
+  what a match actually spent (for a host that bills it to a budget of its
+  own), and `vm_context_set_interrupt` gives the VM a host flag to poll
+  every 4096 steps, so a long match can be stopped from outside;
+  `vm_context_interrupted` tells that apart from an exhausted budget.
 
 ### Using from JavaScript via npm
 

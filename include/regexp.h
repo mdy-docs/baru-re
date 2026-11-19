@@ -288,6 +288,22 @@ void vm_context_free(VMContext* ctx);
  * report through Program.error like any other compile error. */
 void vm_context_set_step_budget(VMContext* ctx, uint64_t max_steps);
 bool vm_context_budget_exhausted(const VMContext* ctx);
+
+/* The steps the context has spent since its budget was last armed (with no budget, none are
+ * counted: 0). A host that bills the engine's work to a budget of its own -- an instruction
+ * budget in a script engine, say -- arms the step budget to what it can afford, then charges
+ * what was actually spent. */
+uint64_t vm_context_steps_used(const VMContext* ctx);
+
+/* An interrupt flag the VM polls while it runs: every 4096 steps, and only under a step budget
+ * (the flag is read where the steps are counted). Once it reads nonzero the in-flight match is
+ * abandoned as an exhausted budget abandons it -- vm_execute returns false and
+ * vm_context_budget_exhausted reports true -- and vm_context_interrupted tells the two apart.
+ * The flag is the host's: set from another thread or a signal handler, it stops a long match
+ * without waiting for the budget. NULL (the default) polls nothing. Re-arming the budget clears
+ * the interrupted state, not the flag. */
+void vm_context_set_interrupt(VMContext* ctx, const volatile int* flag);
+bool vm_context_interrupted(const VMContext* ctx);
 bool vm_execute(Program* prog, VMContext* ctx, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures);
 
 /* One-shot convenience wrapper: creates a context, runs vm_execute once,
