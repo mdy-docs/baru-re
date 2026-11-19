@@ -92,20 +92,32 @@ static inline bool is_digit_char(uint32_t c) {
  * add_range/fill_builtin_class/etc, which is wasted work but never unsafe,
  * since a Program with prog->error set is discarded by regex_compile()
  * without ever being executed (see src/regex_wasm.c), so the resulting
- * (reused, semantically-nonsensical) slot contents are never read. */
-static int alloc_class(Program* prog) {
-    if (prog->class_count >= MAX_CLASSES) {
-        if (!prog->error) prog->error = "InternalError: pattern exceeds maximum character class count";
-        return MAX_CLASSES - 1;
-    }
-    int cid = prog->class_count++;
-    /* Belt-and-braces: compile_into re-entry already freed every slot's
-     * heap buffers, and class_free NULLs the pointers, so
-     * this is a no-op there -- but it keeps the "slot is built in place"
+ * (reused, semantically-nonsensical) slot contents are never read.
+ *
+ * The reused slot is emptied like a fresh one, though: it still owns the
+ * previous class's heap buffers, and the class parsers build a class in a
+ * local and then assign it over the slot (parse_char_class's
+ * `*cls = current_union`), which dropped those buffers unfreed -- a leak on
+ * every over-limit pattern (LeakSanitizer in CI: 128 bytes from
+ * add_range for 257 x "[a]"). */
+static void reset_class_slot(Program* prog, int cid) {
+    /* Belt-and-braces for a fresh slot: compile_into re-entry already freed
+     * every slot's heap buffers, and class_free NULLs the pointers, so this
+     * is a no-op there -- but it keeps the "slot is built in place"
      * invariant self-contained rather than trusting the caller's reset. */
     class_free(&prog->classes[cid]);
     memset(&prog->classes[cid], 0, sizeof(CharClass)); /* slot is built in place */
     prog->classes[cid].alloc = &prog->alloc;
+}
+
+static int alloc_class(Program* prog) {
+    if (prog->class_count >= MAX_CLASSES) {
+        if (!prog->error) prog->error = "InternalError: pattern exceeds maximum character class count";
+        reset_class_slot(prog, MAX_CLASSES - 1);
+        return MAX_CLASSES - 1;
+    }
+    int cid = prog->class_count++;
+    reset_class_slot(prog, cid);
     return cid;
 }
 

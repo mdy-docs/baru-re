@@ -30,6 +30,38 @@ static void check(int cond, const char* what) {
     }
 }
 
+/* Live blocks of a Program built through a counting allocator: a compile that
+ * frees everything on its error paths leaves none once released. Only the
+ * Linux CI job's LeakSanitizer could see such a leak before; this sees it on
+ * every platform. */
+static long live_blocks;
+static void* count_realloc(void* ud, void* p, size_t n) {
+    (void)ud;
+    if (n == 0) {
+        if (p) live_blocks--;
+        free(p);
+        return NULL;
+    }
+    void* q = realloc(p, n);
+    if (q && !p) live_blocks++;
+    return q;
+}
+static long blocks_left_by_compile(const char* repeat, int times, int flags) {
+    char* pat = malloc(strlen(repeat) * (size_t)times + 1);
+    pat[0] = 0;
+    for (int i = 0; i < times; i++) strcat(pat, repeat);
+    uint16_t* u = to_utf16(pat);
+    Program* prog = (Program*)calloc(1, sizeof(Program));
+    live_blocks = 0;
+    program_set_allocator(prog, count_realloc, NULL);
+    compile_into(prog, u, flags);
+    program_release(prog);
+    free(prog);
+    free(u);
+    free(pat);
+    return live_blocks;
+}
+
 int main(void) {
     /* Basic match + capture groups, case-insensitive flag. */
     {
@@ -224,6 +256,21 @@ int main(void) {
         check(regex_exec(h, text, 2, 0), "\\p{L}+ (ordinary property, no strings) still works under /u");
         free(pattern);
         regex_free(h);
+    }
+
+    /* Past MAX_CLASSES every new class reuses the last slot, which still
+     * owned the previous class's buffers: assigning the new class over it
+     * leaked them (128 bytes from add_range for 257 x "[a]", seen only by
+     * the CI job's LeakSanitizer). Each class-building path, past the limit
+     * and at it, must leave nothing behind once the Program is released. */
+    {
+        check(blocks_left_by_compile("[a]", 256, 0) == 0, "256 x [a]: nothing left after release");
+        check(blocks_left_by_compile("[a]", 257, 0) == 0, "257 x [a] (over the limit): nothing leaked");
+        check(blocks_left_by_compile("[a]", 300, regex_flag_bit('v')) == 0, "300 x [a]/v (over the limit): nothing leaked");
+        check(blocks_left_by_compile("\\d", 300, 0) == 0, "300 x \\d (over the limit): nothing leaked");
+        check(blocks_left_by_compile("\\p{L}", 300, regex_flag_bit('u')) == 0, "300 x \\p{L}/u (over the limit): nothing leaked");
+        check(blocks_left_by_compile("[^a-z]", 300, regex_flag_bit('i')) == 0, "300 x [^a-z]/i (over the limit): nothing leaked");
+        check(blocks_left_by_compile(".", 300, regex_flag_bit('u')) == 0, "300 x ./u (over the limit): nothing leaked");
     }
 
     /* MAX_CLASSES/MAX_GROUPS/MAX_COUNTERS/MAX_OPCODES bounds checking.
