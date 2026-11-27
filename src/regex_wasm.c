@@ -134,7 +134,7 @@ EMSCRIPTEN_KEEPALIVE
 const char* regex_group_name(uintptr_t handle, int index) {
     RegexHandle* h = (RegexHandle*)(uintptr_t)handle;
     if (!h || index < 0 || index > h->prog.group_count) return "";
-    return h->prog.group_names[index];
+    return program_group_name(&h->prog, index);
 }
 
 /* Searches `text[0..text_units)` for a match starting at or after
@@ -238,7 +238,9 @@ void regex_set_step_budget(uintptr_t handle, double max_steps) {
 /* Whether the most recent regex_exec() on this handle stopped because it
  * exhausted the step budget (1) rather than genuinely finding no match (0).
  * Lets a host surface a catchable "pattern too expensive" error instead of
- * conflating it with no-match. */
+ * conflating it with no-match. A match that needed more backtrack stack
+ * than the engine allows (64MB) or more memory than there was reports 1
+ * too, with or without a budget: none of them is an answer. */
 EMSCRIPTEN_KEEPALIVE
 int regex_budget_exhausted(uintptr_t handle) {
     RegexHandle* h = (RegexHandle*)(uintptr_t)handle;

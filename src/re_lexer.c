@@ -94,6 +94,15 @@ static inline bool is_digit_char(uint32_t c) {
  * without ever being executed (see src/regex_wasm.c), so the resulting
  * (reused, semantically-nonsensical) slot contents are never read.
  *
+ * Below the limit the slot table grows to hold the new slot (it was a
+ * MAX_CLASSES-sized array embedded in every Program, 12KB whether the
+ * pattern had a class or not). Growth may move the table, so no caller keeps
+ * a pointer to an earlier slot across this call -- nested class syntax is
+ * built in locals and assigned over the slot at the end. When the table
+ * cannot grow there may be no slot at all to hand back (the first class of a
+ * pattern), so that failure is -1 with prog->error set, and the token
+ * scanner leaves as it does for any other error.
+ *
  * The reused slot is emptied like a fresh one, though: it still owns the
  * previous class's heap buffers, and the class parsers build a class in a
  * local and then assign it over the slot (parse_char_class's
@@ -115,6 +124,18 @@ static int alloc_class(Program* prog) {
         if (!prog->error) prog->error = "InternalError: pattern exceeds maximum character class count";
         reset_class_slot(prog, MAX_CLASSES - 1);
         return MAX_CLASSES - 1;
+    }
+    if (prog->class_count == prog->class_cap) {
+        int new_cap = prog->class_cap ? prog->class_cap * 2 : 4;
+        CharClass* grown = re_realloc(&prog->alloc, prog->classes, sizeof(CharClass) * (size_t)new_cap);
+        if (!grown) {
+            if (!prog->error) prog->error = re_oom_error;
+            return -1;
+        }
+        /* reset_class_slot frees what a slot holds before building in it */
+        memset(grown + prog->class_cap, 0, sizeof(CharClass) * (size_t)(new_cap - prog->class_cap));
+        prog->classes = grown;
+        prog->class_cap = new_cap;
     }
     int cid = prog->class_count++;
     reset_class_slot(prog, cid);
@@ -1541,6 +1562,7 @@ static void scan_token(Lexer* lexer) {
             break;
         case '.': {
             int cid = alloc_class(lexer->prog);
+            if (cid < 0) return;
             /* 0xFFFF, not 255, without /u: same full-code-unit-space
              * invariant as fill_builtin_class above. The U+2028/U+2029 LineTerminator exclusion applies in
              * both modes -- the old non-unicode branch skipping it was only
@@ -1562,6 +1584,7 @@ static void scan_token(Lexer* lexer) {
             if (esc == 0) { lexer->prog->error = "SyntaxError: \\ at end of pattern"; return; }
             if (esc < 128 && strchr("dDwWsS", (char)esc)) {
                 int cid = alloc_class(lexer->prog);
+                if (cid < 0) return;
                 fill_builtin_class(&lexer->prog->classes[cid], (char)esc, lexer->prog->unicode, lexer->prog->unicode && lexer->prog->ignore_case);
                 lexer->current = (Token){TOK_CLASS, 0, cid};
             }
@@ -1628,6 +1651,7 @@ static void scan_token(Lexer* lexer) {
             else if (esc == 'p' || esc == 'P') {
                 if (lexer->prog->unicode) {
                     int cid = alloc_class(lexer->prog);
+                    if (cid < 0) return;
                     if (!parse_property_escape_class(lexer, &lexer->prog->classes[cid], esc == 'P')) return;
                     lexer->current = (Token){TOK_CLASS, 0, cid};
                 } else {
@@ -1691,6 +1715,7 @@ static void scan_token(Lexer* lexer) {
         }
         case '[': {
             int cid = alloc_class(lexer->prog);
+            if (cid < 0) return;
             if (lexer->prog->unicode_sets) parse_char_class_v(lexer, &lexer->prog->classes[cid]);
             else parse_char_class(lexer, &lexer->prog->classes[cid]);
             lexer->current = (Token){TOK_CLASS, 0, cid};

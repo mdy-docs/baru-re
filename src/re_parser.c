@@ -27,6 +27,29 @@
  * propagates outward as an empty subtree. What callers here must do is (a)
  * not dereference the result, and (b) free any child they had already built
  * and were about to hand to it, since nothing else owns it. */
+/* Records group gid's name, growing the table to reach it. The table is
+ * allocated here, by the first named group, and not in the Program: most
+ * patterns name nothing, and 8KB of names in each of them was most of what
+ * constructing a small pattern cost (see Program in regexp.h). Entries for
+ * the unnamed groups below gid are zeroed -- name lookups compare against
+ * them. */
+static void name_group(Program* prog, int gid, const char* name) {
+    if (gid >= prog->name_cap) {
+        int cap = prog->name_cap ? prog->name_cap : 8;
+        while (cap <= gid) cap *= 2;
+        if (cap > MAX_GROUPS) cap = MAX_GROUPS;
+        char (*grown)[MAX_GROUP_NAME] = re_realloc(&prog->alloc, prog->group_names, sizeof(*grown) * (size_t)cap);
+        if (!grown) {
+            if (!prog->error) prog->error = re_oom_error;
+            return;
+        }
+        memset(grown + prog->name_cap, 0, sizeof(*grown) * (size_t)(cap - prog->name_cap));
+        prog->group_names = grown;
+        prog->name_cap = cap;
+    }
+    strcpy(prog->group_names[gid], name);
+}
+
 static ASTNode* create_node(Lexer* lexer, ASTType type) {
     ASTNode* node = re_calloc(&lexer->prog->alloc, 1, sizeof(ASTNode));
     if (!node) {
@@ -113,7 +136,7 @@ static ASTNode* parse_primary(Lexer* lexer) {
         if (is_capture) {
             if (lexer->prog->group_count < MAX_GROUPS - 1) {
                 gid = ++lexer->prog->group_count;
-                if (is_named) strcpy(lexer->prog->group_names[gid], name);
+                if (is_named) name_group(lexer->prog, gid, name);
             } else {
                 if (!lexer->prog->error) lexer->prog->error = "InternalError: pattern exceeds maximum capture group count";
             }
@@ -345,63 +368,53 @@ void free_ast(const RegexAllocator* a, ASTNode* node) {
 
 /* Non-static: called from re_compiler.c's compile_into. Declared in
  * re_internal.h. */
-bool validate_group_names(const RegexAllocator* a, ASTNode* node, NameSet* out_set, const char** error) {
+bool validate_group_names(ASTNode* node, const char** names, int* count, const char** error) {
     if (!node) return true;
-    /* The two child NameSets are HEAP-allocated: as ~8KB stack locals they
-     * made this the most stack-hungry recursion over the AST (observed
-     * crashing near depth ~247 on an 8MB stack), which is what originally
-     * forced MAX_AST_DEPTH down to 200 -- a depth real patterns hit
-     * (test262 exercises 200 nested groups). With small frames here, the
-     * depth cap could be raised; see MAX_AST_DEPTH in include/regexp.h. */
-    NameSet* sets = re_calloc(a, 2, sizeof(NameSet));
-    if (!sets) {
-        if (!*error) *error = re_oom_error;
-        return false; /* nothing allocated yet, so nothing to unwind */
-    }
-    NameSet* left_set = &sets[0];
-    NameSet* right_set = &sets[1];
-    bool ok = false;
-    if (!validate_group_names(a, node->left, left_set, error)) goto done;
-    if (!validate_group_names(a, node->right, right_set, error)) goto done;
+    /* One stack of name pointers for the whole walk: the left subtree leaves
+     * its distinct names in [base, mid), the right one in [mid, top), and
+     * this node merges the two in place. Each node used to get two NameSets
+     * of its own -- 16KB of copied names, first as stack locals (the most
+     * stack-hungry recursion over the AST, crashing near depth ~247 on an
+     * 8MB stack, which is what once forced MAX_AST_DEPTH down to 200), then
+     * as a zeroed heap block per node, which made validating /a+b/ cost more
+     * than compiling it. A frame here is now a few words; see MAX_AST_DEPTH
+     * in include/regexp.h. The stack cannot overflow: a name is pushed once
+     * per named group, and there are fewer than MAX_GROUPS of those. */
+    const int base = *count;
+    if (!validate_group_names(node->left, names, count, error)) return false;
+    const int mid = *count;
+    if (!validate_group_names(node->right, names, count, error)) return false;
+    const int top = *count;
 
     if (node->type == AST_ALT) {
-        for (int i = 0; i < left_set->count; i++) {
-            strcpy(out_set->names[out_set->count++], left_set->names[i]);
-        }
-        for (int i = 0; i < right_set->count; i++) {
+        /* The alternatives exclude each other, so a name in both is one name */
+        int kept = mid;
+        for (int i = mid; i < top; i++) {
             bool found = false;
-            for (int j = 0; j < left_set->count; j++) {
-                if (strcmp(right_set->names[i], left_set->names[j]) == 0) { found = true; break; }
+            for (int j = base; j < mid; j++) {
+                if (strcmp(names[i], names[j]) == 0) { found = true; break; }
             }
-            if (!found && out_set->count < MAX_GROUPS) strcpy(out_set->names[out_set->count++], right_set->names[i]);
+            if (!found) names[kept++] = names[i];
         }
-        ok = true;
-    } else {
-        for (int i = 0; i < left_set->count; i++) {
-            strcpy(out_set->names[out_set->count++], left_set->names[i]);
-        }
-        for (int i = 0; i < right_set->count; i++) {
-            for (int j = 0; j < left_set->count; j++) {
-                if (strcmp(right_set->names[i], left_set->names[j]) == 0) {
-                    *error = "SyntaxError: Duplicate capture group name";
-                    goto done;
-                }
-            }
-            if (out_set->count < MAX_GROUPS) strcpy(out_set->names[out_set->count++], right_set->names[i]);
-        }
-
-        if (node->type == AST_GROUP && node->name[0] != '\0') {
-            for (int i = 0; i < out_set->count; i++) {
-                if (strcmp(out_set->names[i], node->name) == 0) {
-                    *error = "SyntaxError: Duplicate capture group name";
-                    goto done;
-                }
-            }
-            if (out_set->count < MAX_GROUPS) strcpy(out_set->names[out_set->count++], node->name);
-        }
-        ok = true;
+        *count = kept;
+        return true;
     }
-done:
-    re_free(a, sets);
-    return ok;
+    for (int i = mid; i < top; i++) {
+        for (int j = base; j < mid; j++) {
+            if (strcmp(names[i], names[j]) == 0) {
+                *error = "SyntaxError: Duplicate capture group name";
+                return false;
+            }
+        }
+    }
+    if (node->type == AST_GROUP && node->name[0] != '\0') {
+        for (int i = base; i < top; i++) {
+            if (strcmp(names[i], node->name) == 0) {
+                *error = "SyntaxError: Duplicate capture group name";
+                return false;
+            }
+        }
+        if (*count < MAX_GROUPS) names[(*count)++] = node->name;
+    }
+    return true;
 }

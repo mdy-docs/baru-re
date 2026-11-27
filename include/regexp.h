@@ -13,9 +13,8 @@
 #define MAX_GROUPS 255
 /* 256, not the original 64: real-world patterns clear 64 (test262's
  * classic XML shallow-parsing regex builds 72 distinct classes in one
- * pattern), and now that a CharClass is a ~50B header over heap-sized
- * range/string buffers -- not a ~16KB embedded array -- the slot table is
- * cheap enough to size generously. */
+ * pattern). Only a cap on the id space: the slot table is on the heap and
+ * grows with the classes a pattern actually has (Program.classes). */
 #define MAX_CLASSES 256
 /* 256, not the original 16: every quantifier consumes a counter id, and
  * ordinary real-world patterns blow past 16 -- test262's classic XML
@@ -29,12 +28,12 @@
 /* Capture-group name buffer size in bytes: 31 UTF-8 bytes + NUL. An engine
  * limit, not a spec one (ECMAScript puts no length cap on group names) --
  * over-long names fail compilation loudly.
- * Shared by Program.group_names, the parser/lexer's Token/ASTNode name
+ * Shared by Program.group_names' entries, the parser/lexer's Token/ASTNode name
  * buffers, and the append bound in rx_name_append_utf8; sizing one without
  * the others would silently reintroduce a truncation bug. */
 #define MAX_GROUP_NAME 32
 
-/* Unlike the four MAX_* above (which size fixed arrays and are checked at
+/* Unlike the four MAX_* above (which cap id spaces and are checked at
  * their respective allocation sites), this
  * bounds AST *height*, not a data structure's capacity: the parser
  * (re_parser.c) computes each node's subtree height as it's built and
@@ -44,7 +43,8 @@
  * validate_backrefs, validate_named_backrefs, compile_node).
  * Two changes made 400 safe where 200 once was the ceiling:
  * validate_group_names' two ~8KB NameSet locals per frame (ASan-observed
- * crash near depth ~247 on an 8MB stack) moved to the heap, and the
+ * crash near depth ~247 on an 8MB stack) are gone (it now works on one
+ * caller-owned stack of name pointers), and the
  * parser now builds BALANCED concat/alternation trees, so height tracks
  * real bracket nesting rather than pattern length. The remaining
  * recursions carry small frames -- the largest per-level cost is vm_run's
@@ -164,20 +164,38 @@ typedef struct {
  * demand up to the MAX_OPCODES hard cap, and compile_into re-entry reuses
  * the buffer across recompiles. It was a fixed Instruction[MAX_OPCODES]
  * embedded array -- 786KB per Program whether the pattern needed 10
- * instructions or 30k. With that and CharClass's buffers right-sized, a
- * typical compiled Program is tens of KB, not the ~2MB the fixed layout
- * cost. */
+ * instructions or 30k.
+ *
+ * The class slots and the group names are on the heap for the same reason:
+ * as embedded MAX_CLASSES/MAX_GROUPS-sized arrays they were ~21KB in every
+ * Program, which is what a host holding (or merely constructing) many small
+ * patterns paid for each one -- /a+b/ has no class and no name. The struct
+ * is now a ~150-byte header, and a compiled pattern costs what it uses. */
 typedef struct {
     Instruction* code;
     int code_cap;
-    CharClass classes[MAX_CLASSES];
-    char group_names[MAX_GROUPS][MAX_GROUP_NAME];
+    /* class_cap slots, class_count in use; grown by the lexer as classes
+     * appear (so a pointer to a slot does not survive the next class being
+     * allocated), kept across recompiles like code. NULL iff class_cap is 0. */
+    CharClass* classes;
+    int class_cap;
+    /* The names of groups 0..name_cap-1 (an unnamed group's is ""), or NULL
+     * with name_cap 0 when the pattern names no group. It ends at the last
+     * named group, not at group_count, so read it through
+     * program_group_name. */
+    char (*group_names)[MAX_GROUP_NAME];
+    int name_cap;
     /* name_chain[i] = the next group id > i sharing group i's name (0 =
-     * none). Built once by compile_into after parsing; OP_NAMED_BACKREF
+     * none), for i < name_cap; NULL like group_names. Built once by
+     * compile_into after parsing; OP_NAMED_BACKREF
      * walks it to find the participating group among ES2025 duplicate
      * names, replacing the strcmp scan over every group name the VM used
      * to do per execution. */
-    int name_chain[MAX_GROUPS];
+    int* name_chain;
+    /* How deeply the pattern nests lookarounds (0 = it has none). Each
+     * level is one recursive VM entry with its own scratch, so this is what
+     * sizes a VMContext. */
+    int look_depth;
     int code_count;
     int class_count;
     int group_count;
@@ -227,6 +245,13 @@ typedef struct {
 
 void compile_into(Program* prog, const uint16_t* regex, int flags);
 
+/* The name of capture group `group` (1-based), "" when it has none or is out
+ * of range. The way to read Program.group_names: the table exists only for a
+ * pattern that names a group, and stops at the last one that does. */
+static inline const char* program_group_name(const Program* prog, int group) {
+    return group >= 0 && group < prog->name_cap ? prog->group_names[group] : "";
+}
+
 /* Routes every allocation this Program (and any VMContext created for it)
  * makes through fn/userdata instead of libc. Call on a ZERO-INITIALIZED
  * Program before its first compile_into: the handle is read back at every
@@ -239,21 +264,26 @@ void program_set_allocator(Program* prog, RegexReallocFn fn, void* userdata);
  * on an empty class; the pointers are NULLed). */
 void class_free(CharClass* cls);
 
-/* Releases every heap buffer a Program owns -- the code array and all
- * classes' range/string buffers -- leaving the struct reusable for another
+/* Releases every heap buffer a Program owns -- the code array, the class
+ * slots and all classes' range/string buffers, the group names -- leaving
+ * the struct reusable for another
  * compile_into (and safe to call on a zero-initialized, never-compiled
  * Program). A host that drives compile_into directly must call this before
  * discarding a Program; the regex_wasm.c shim's regex_free does. */
 void program_release(Program* prog);
 
 /* Reusable execution scratch (backtrack stacks, capture arenas, fail
- * caches -- one set per lookaround recursion depth, allocated lazily and
- * kept until freed). Create one per exec *call* and pass it to vm_execute
+ * caches -- one set per lookaround recursion depth the pattern can reach,
+ * each allocated at first use, grown as a match needs and
+ * kept until freed; a context that has matched a simple pattern holds a few
+ * hundred bytes). Create one per exec *call* and pass it to vm_execute
  * for every start position tried within that call: an unanchored search
  * over N code units re-enters the VM up to N times, and paying
  * allocation + fail-cache initialization per position instead of per call
- * dominated the runtime by orders of magnitude. A context is tied to the group count of the Program it was
- * created for, and is not thread-safe -- one context per thread. */
+ * dominated the runtime by orders of magnitude. A context is tied to the Program it was
+ * created for as that Program was compiled (its group count, its lookaround
+ * depth): recompile the Program and the context must be replaced. It is not
+ * thread-safe -- one context per thread. */
 typedef struct VMContext VMContext;
 /* NULL if the context could not be allocated. A caller that treats that as
  * "no match" reports a wrong answer; treat it like budget exhaustion below
@@ -267,12 +297,12 @@ void vm_context_free(VMContext* ctx);
  * execute across every vm_execute entry (including lookaround recursion)
  * for the context's whole lifetime. 0 (the default) means unlimited --
  * existing consumers are unaffected unless they opt in. When the budget is
- * exhausted the in-flight match is abandoned (vm_execute returns false,
- * like the VM_STACK_MAX limit) and vm_context_budget_exhausted() reports
+ * exhausted the in-flight match is abandoned (vm_execute returns false)
+ * and vm_context_budget_exhausted() reports
  * true, letting a host distinguish "no match" from "gave up" and surface a
  * catchable error instead of hanging. This is the engine's defense against
  * catastrophic backtracking that the fail cache does not catch: the cache
- * is direct-mapped (CACHE_SIZE slots, collisions evict) and is
+ * is direct-mapped (at most CACHE_SIZE slots, collisions evict) and is
  * generation-cleared across lookaround boundaries, so pathological
  * patterns -- /(a+)+$/ against a few hundred 'a's is enough -- still
  * backtrack exponentially without a budget. Embedders running untrusted
@@ -288,6 +318,21 @@ void vm_context_free(VMContext* ctx);
  * report through Program.error like any other compile error. */
 void vm_context_set_step_budget(VMContext* ctx, uint64_t max_steps);
 bool vm_context_budget_exhausted(const VMContext* ctx);
+
+/* The backtrack stack's bound. A greedy loop saves one entry per iteration, so a long enough
+ * run of matching text needs a deep stack; a context's stacks (one per lookaround depth) may
+ * come to max_bytes together, 64MB unless set here, which is V8's figure for its own. A match
+ * that needs more is abandoned as an exhausted budget abandons it -- vm_execute returns false
+ * and vm_context_budget_exhausted reports true, because "no match" would be a wrong answer --
+ * and vm_context_stack_exhausted tells the two apart (V8 throws a RangeError here). The state
+ * is sticky like the budget's and cleared by re-arming it (vm_context_set_step_budget, with 0
+ * for a host that sets none); the context stays usable. A depth's first few entries are given
+ * whatever the limit, which bounds growth. vm_context_stack_bytes is what the stacks hold now:
+ * they are kept for the context's lifetime, so a host that keeps contexts can free one that a
+ * single deep match left large. */
+void vm_context_set_stack_limit(VMContext* ctx, size_t max_bytes);
+size_t vm_context_stack_bytes(const VMContext* ctx);
+bool vm_context_stack_exhausted(const VMContext* ctx);
 
 /* The steps the context has spent since its budget was last armed (with no budget, none are
  * counted: 0). A host that bills the engine's work to a budget of its own -- an instruction

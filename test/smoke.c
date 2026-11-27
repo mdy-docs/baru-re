@@ -62,6 +62,88 @@ static long blocks_left_by_compile(const char* repeat, int times, int flags) {
     return live_blocks;
 }
 
+/* An allocator that refuses: the request numbered fail_at (from 1), and with
+ * fail_sticky every one after it too, which is what an embedder's heap limit
+ * does. Counts live blocks like count_realloc. */
+static long alloc_calls, fail_at;
+static bool fail_sticky, fail_injected;
+static void* flaky_realloc(void* ud, void* p, size_t n) {
+    (void)ud;
+    if (n == 0) {
+        if (p) live_blocks--;
+        free(p);
+        return NULL;
+    }
+    alloc_calls++;
+    if (fail_at && (alloc_calls == fail_at || (fail_sticky && alloc_calls > fail_at))) {
+        fail_injected = true;
+        return NULL;
+    }
+    void* q = realloc(p, n);
+    if (q && !p) live_blocks++;
+    return q;
+}
+
+/* One compile and one scan under flaky_realloc. 1 or 0 is the scan's answer
+ * (the whole match's span in span[]); -1 says the engine reported that it
+ * could not finish, at compile time or in the match; -2 is a wrong report: a
+ * compile error that is not the out-of-memory one. *leaked is what was still
+ * allocated after everything was released. */
+static int flaky_run(const uint16_t* pat, int flags, const uint16_t* text, int tl, long* span, long* leaked) {
+    Program* prog = (Program*)calloc(1, sizeof(Program));
+    live_blocks = 0; alloc_calls = 0; fail_injected = false;
+    program_set_allocator(prog, flaky_realloc, NULL);
+    compile_into(prog, pat, flags);
+    int result;
+    if (prog->error) {
+        result = strstr(prog->error, "out of memory") ? -1 : -2;
+    } else {
+        const uint16_t* caps[MAX_GROUPS * 2] = {0};
+        VMContext* c = vm_context_new(prog);
+        bool m = false;
+        for (int i = 0; c && i <= tl && !m; i++)
+            m = vm_execute(prog, c, 0, 1, text, text + tl, text + i, caps);
+        if (!c || vm_context_budget_exhausted(c)) result = -1;
+        else {
+            result = m ? 1 : 0;
+            if (m) { span[0] = caps[0] - text; span[1] = caps[1] - text; }
+        }
+        vm_context_free(c);
+    }
+    program_release(prog);
+    free(prog);
+    *leaked = live_blocks;
+    return result;
+}
+
+/* Every allocation a compile and a match make, refused in turn: the engine
+ * must say so (never crash, never answer wrongly) and leave nothing behind. */
+static void flaky_sweep(const char* pattern, int flags, const char* subject, bool sticky, const char* what) {
+    uint16_t* pat = to_utf16(pattern);
+    uint16_t* text = to_utf16(subject);
+    int tl = (int)strlen(subject);
+    long want_span[2] = {-1, -1}, span[2], leaked;
+    fail_at = 0; fail_sticky = sticky;
+    int want = flaky_run(pat, flags, text, tl, want_span, &leaked);
+    long total = alloc_calls;
+    bool ok = want >= 0 && leaked == 0 && total > 0;
+    long refused = 0;
+    for (long k = 1; ok && k <= total; k++) {
+        fail_at = k;
+        span[0] = span[1] = -1;
+        int got = flaky_run(pat, flags, text, tl, span, &leaked);
+        if (leaked != 0 || !fail_injected) ok = false;
+        /* A refused allocation may be one the engine can do without (none is
+         * today), so the right answer is as good as the report. */
+        else if (got == -1) refused++;
+        else if (got != want || (got == 1 && (span[0] != want_span[0] || span[1] != want_span[1]))) ok = false;
+        if (!ok) printf("       (request %ld of %ld: result %d, %ld blocks left)\n", k, total, got, leaked);
+    }
+    fail_at = 0;
+    check(ok && refused > 0, what);
+    free(pat); free(text);
+}
+
 int main(void) {
     /* Basic match + capture groups, case-insensitive flag. */
     {
@@ -986,6 +1068,49 @@ int main(void) {
         free(pattern);
         regex_free(h);
 
+        /* The stack's bound is bytes, and reaching it is "could not finish":
+         * it was 2^19 entries and read as no match, so /^[a-z]+$/ answered
+         * false for 600,000 letters. */
+        {
+            int big = 600000;
+            uint16_t* run = (uint16_t*)malloc(sizeof(uint16_t) * big);
+            for (int i = 0; i < big; i++) run[i] = (uint16_t)('a' + (i % 26));
+            uint16_t* pa = to_utf16("^[a-z]+$");
+            Program* prog = (Program*)calloc(1, sizeof(Program));
+            compile_into(prog, pa, 0);
+            const uint16_t* caps2[4] = {0};
+            VMContext* c = vm_context_new(prog);
+            check(vm_execute(prog, c, 0, 1, run, run + big, run, caps2) && caps2[1] == run + big &&
+                  !vm_context_budget_exhausted(c),
+                  "^[a-z]+$ matches a 600k-unit run (was: no match past 2^19 backtrack entries)");
+            check(vm_context_stack_bytes(c) > (size_t)big * 40 && vm_context_stack_bytes(c) <= ((size_t)64 << 20),
+                  "the context reports what its stacks hold, within the default limit");
+            vm_context_free(c);
+
+            /* a limit of a thousand entries: the last growth is what still fits, not a doubling */
+            c = vm_context_new(prog);
+            check(vm_execute(prog, c, 0, 1, run, run + 4, run, caps2), "a short run matches");
+            size_t entry = vm_context_stack_bytes(c) / 16;
+            vm_context_set_stack_limit(c, entry * 1000);
+            check(vm_execute(prog, c, 0, 1, run, run + 990, run, caps2) && !vm_context_stack_exhausted(c),
+                  "a run that fits the stack limit matches");
+            check(vm_context_stack_bytes(c) == entry * 1000, "the stack grows to its limit exactly");
+            check(!vm_execute(prog, c, 0, 1, run, run + 1100, run, caps2) &&
+                  vm_context_budget_exhausted(c) && vm_context_stack_exhausted(c) && !vm_context_interrupted(c),
+                  "a run past the stack limit is reported as one that could not be finished");
+            check(!vm_execute(prog, c, 0, 1, run, run + 4, run, caps2),
+                  "and the context refuses until it is re-armed");
+            vm_context_set_step_budget(c, 0);
+            check(!vm_context_budget_exhausted(c) && !vm_context_stack_exhausted(c) &&
+                  vm_execute(prog, c, 0, 1, run, run + 990, run, caps2),
+                  "re-arming clears it and the context matches again");
+            vm_context_free(c);
+            program_release(prog);
+            free(prog);
+            free(pa);
+            free(run);
+        }
+
         uint16_t* pu = to_utf16("\\p{L}+");
         uintptr_t hu = regex_compile(pu, 0, regex_flag_bit('u'));
         int mu = regex_exec(hu, text, n, 0);
@@ -1644,6 +1769,141 @@ int main(void) {
         h = regex_compile(pattern, 0, regex_flag_bit('v'));
         check(h != 0 && regex_exec(h, &text, 1, 0), "[^]/v compiles and matches anything");
         free(pattern); regex_free(h);
+    }
+
+    /* Sized by need: a Program's class slots and group names, and a
+     * VMContext's depths, backtrack stack and fail cache, were fixed-size
+     * (21KB in every Program, 16KB of name scratch per AST node while
+     * compiling, ~280KB at a pattern's first match). They start small or
+     * absent now and grow; these cross every growth step. */
+    {
+        /* 40 named groups: the names array grows 8 -> 16 -> 32 -> 64, and a
+         * \k to the last name resolves through it. */
+        char pat[1024]; int n = 0;
+        for (int g = 0; g < 40; g++) n += snprintf(pat + n, sizeof pat - (size_t)n, "(?<g%d>a)", g);
+        snprintf(pat + n, sizeof pat - (size_t)n, "\\k<g39>");
+        uint16_t* pattern = to_utf16(pat);
+        uint16_t* text = to_utf16("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); /* 42 */
+        uintptr_t h = regex_compile(pattern, 0, 0);
+        check(h != 0 && regex_group_count(h) == 40, "40 named groups compile");
+        check(h != 0 && strcmp(regex_group_name(h, 1), "g0") == 0 && strcmp(regex_group_name(h, 40), "g39") == 0 &&
+              regex_group_name(h, 0)[0] == 0,
+              "40 named groups: first and last names read back, group 0 has none");
+        check(h != 0 && regex_exec(h, text, 42, 0) && regex_captures_ptr(h)[0] == 0 && regex_captures_ptr(h)[1] == 41,
+              "40 named groups: \\k<g39> matches the last group's text");
+        free(pattern); free(text); regex_free(h);
+
+        /* No named group: there is no names array at all, and every lookup
+         * says "unnamed" rather than reading one. */
+        pattern = to_utf16("(a)(b)");
+        h = regex_compile(pattern, 0, 0);
+        check(h != 0 && regex_group_name(h, 1)[0] == 0 && regex_group_name(h, 2)[0] == 0,
+              "a pattern without named groups reports every group unnamed");
+        Program* bare = (Program*)calloc(1, sizeof(Program));
+        compile_into(bare, pattern, 0);
+        check(!bare->error && bare->group_names == NULL && program_group_name(bare, 1)[0] == 0 &&
+              program_group_name(bare, 200)[0] == 0 && program_group_name(bare, -1)[0] == 0,
+              "program_group_name is \"\" for any index when no group is named");
+        program_release(bare); free(bare);
+        free(pattern); regex_free(h);
+
+        /* A named group after unnamed ones: the array covers the groups
+         * before it, as unnamed. */
+        pattern = to_utf16("(a)(b)(c)(d)(e)(f)(g)(h)(i)(?<last>j)\\k<last>");
+        text = to_utf16("abcdefghijj");
+        h = regex_compile(pattern, 0, 0);
+        check(h != 0 && regex_group_name(h, 9)[0] == 0 && strcmp(regex_group_name(h, 10), "last") == 0 &&
+              regex_exec(h, text, 11, 0) && regex_captures_ptr(h)[1] == 11,
+              "a named 10th group after nine unnamed ones resolves");
+        free(pattern); free(text); regex_free(h);
+
+        /* Nine classes: the class slots grow 4 -> 8 -> 16 while earlier
+         * classes are already built. */
+        pattern = to_utf16("[a][b][c][d][e][f][g][h][i-k]");
+        text = to_utf16("xabcdefghj");
+        h = regex_compile(pattern, 0, 0);
+        check(h != 0 && regex_exec(h, text, 10, 0) && regex_captures_ptr(h)[0] == 1 && regex_captures_ptr(h)[1] == 10,
+              "nine classes: each still matches its own set after the slots grew");
+        free(pattern); free(text); regex_free(h);
+
+        /* Lookarounds four deep, and two side by side: the context has a
+         * depth for each level the pattern can reach and no more. */
+        pattern = to_utf16("(?=a(?=b(?!c(?<=bc))))(?=ab)ab");
+        text = to_utf16("abd");
+        h = regex_compile(pattern, 0, 0);
+        check(h != 0 && regex_exec(h, text, 3, 0) && regex_captures_ptr(h)[1] == 2,
+              "lookarounds nested three deep match");
+        free(pattern); free(text); regex_free(h);
+        pattern = to_utf16("a(?=b(?=c(?=d(?=e))))");
+        text = to_utf16("abcdx abcde");
+        h = regex_compile(pattern, 0, 0);
+        check(h != 0 && regex_exec(h, text, 11, 0) && regex_captures_ptr(h)[0] == 6,
+              "lookaheads nested four deep reject the near miss and find the match");
+        free(pattern); free(text); regex_free(h);
+
+        /* The backtrack stack starts at 16 entries: a greedy run of 5000
+         * pushes one per iteration and backs out of all of them. */
+        {
+            int len = 5000;
+            uint16_t* run = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)(len + 1));
+            for (int i = 0; i < len; i++) run[i] = 'a';
+            run[len] = 0;
+            pattern = to_utf16("a*b|a{5000}");
+            h = regex_compile(pattern, 0, 0);
+            check(h != 0 && regex_exec(h, run, len, 0) && regex_captures_ptr(h)[1] == len,
+                  "a 5000-deep backtrack grows the stack from 16 and unwinds it");
+            free(pattern); free(run); regex_free(h);
+        }
+
+        /* The fail cache starts absent, appears at the first failed path and
+         * grows 64 -> 256 -> 1024 -> 4096 -> 8192 as paths fail; what it
+         * held is dropped each time. The answer must not depend on any of
+         * it, and neither may the step count depend on where the subject
+         * lives: the hash once took the subject's address, so one match cost
+         * a host that charges for steps different amounts on different runs. */
+        {
+            static uint16_t fixed[64];
+            Program* prog = (Program*)calloc(1, sizeof(Program));
+            uint16_t* p = to_utf16("(a*)*b|(?:a|aa)+$|(?:x{0,3}a){2,}c");
+            compile_into(prog, p, 0);
+            uint16_t* heap = (uint16_t*)malloc(sizeof(uint16_t) * 64);
+            uint64_t steps[3] = {0, 0, 0};
+            bool matched[3] = {true, true, true}, spent[3] = {false, false, false};
+            for (int v = 0; v < 3 && !prog->error; v++) {
+                /* 18 a's then 'd': no alternative matches at any start */
+                uint16_t* t = v == 0 ? fixed : v == 1 ? heap : heap + 5;
+                for (int i = 0; i < 18; i++) t[i] = 'a';
+                t[18] = 'd';
+                const uint16_t* caps[MAX_GROUPS * 2] = {0};
+                VMContext* c = vm_context_new(prog);
+                vm_context_set_step_budget(c, 400ull * 1000 * 1000);
+                matched[v] = false;
+                for (int i = 0; i <= 19 && !matched[v]; i++)
+                    matched[v] = vm_execute(prog, c, 0, 1, t, t + 19, t + i, caps);
+                steps[v] = vm_context_steps_used(c);
+                spent[v] = vm_context_budget_exhausted(c);
+                vm_context_free(c);
+            }
+            check(!prog->error && !matched[0] && !matched[1] && !matched[2] && !spent[0] && !spent[1] && !spent[2],
+                  "a search that fails many thousand paths ends in no match");
+            check(steps[0] > 100000 && steps[0] == steps[1] && steps[1] == steps[2],
+                  "the same subject at three addresses takes the same number of steps");
+            program_release(prog); free(prog); free(p); free(heap);
+        }
+
+        /* Each allocation refused in turn, once and from then on. */
+        flaky_sweep("(?<y>\\d{4})-(?<m>\\d\\d)(?=[a-z](?<![0-9]))[abc]+\\w\\s.[^x]\\p{L}", regex_flag_bit('u'),
+                    "on 2026-11abc_ zzq", false,
+                    "names, classes and lookarounds: each allocation refused once is reported, nothing leaks");
+        flaky_sweep("(?<y>\\d{4})-(?<m>\\d\\d)(?=[a-z](?<![0-9]))[abc]+\\w\\s.[^x]\\p{L}", regex_flag_bit('u'),
+                    "on 2026-11abc_ zzq", true,
+                    "names, classes and lookarounds: allocation refused from each point on is reported, nothing leaks");
+        flaky_sweep("(?:a|aa)+$|(a{1,3}){2,}c", 0, "aaaaaaaaaaaaaab", false,
+                    "stack and fail-cache growth: each allocation refused once is reported, nothing leaks");
+        flaky_sweep("(?:a|aa)+$|(a{1,3}){2,}c", 0, "aaaaaaaaaaaaaab", true,
+                    "stack and fail-cache growth: allocation refused from each point on is reported, nothing leaks");
+        flaky_sweep("(?<a>x)|(?<a>y)|(?:(?<b>p)|(?<b>q))\\k<b>", 0, "zqq", false,
+                    "duplicate names and \\k: each allocation refused once is reported, nothing leaks");
     }
 
     if (failures == 0) {

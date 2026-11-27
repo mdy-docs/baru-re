@@ -212,7 +212,7 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
              * empty whenever a *different* alternative's group had
              * captured (found via test262's duplicate-names tests). */
             int gid = -1;
-            for (int i = 1; i <= prog->group_count; i++) {
+            for (int i = 1; i < prog->name_cap && i <= prog->group_count; i++) {
                 if (strcmp(prog->group_names[i], node->name) == 0) {
                     gid = i;
                     break;
@@ -345,7 +345,7 @@ static void validate_named_backrefs(ASTNode* node, Program* prog, const char** e
     if (!node || *error) return;
     if (node->type == AST_NAMED_BACKREF) {
         bool found = false;
-        for (int i = 1; i <= prog->group_count; i++) {
+        for (int i = 1; i < prog->name_cap && i <= prog->group_count; i++) {
             if (strcmp(prog->group_names[i], node->name) == 0) { found = true; break; }
         }
         if (!found) { *error = "SyntaxError: Invalid named capture referenced"; return; }
@@ -478,9 +478,34 @@ void program_set_allocator(Program* prog, RegexReallocFn fn, void* userdata) {
     prog->alloc.ud = userdata;
 }
 
+/* The names belong to one compile: a recompile starts without them, as it
+ * starts with no groups. */
+static void release_names(Program* prog) {
+    re_free(&prog->alloc, prog->group_names);
+    re_free(&prog->alloc, prog->name_chain);
+    prog->group_names = NULL;
+    prog->name_chain = NULL;
+    prog->name_cap = 0;
+}
+
+/* How deeply lookarounds nest under node: what Program.look_depth records.
+ * Recursion is bounded like every other walk of the AST (MAX_AST_DEPTH). */
+static int look_depth(const ASTNode* node) {
+    if (!node) return 0;
+    int l = look_depth(node->left), r = look_depth(node->right);
+    int d = l > r ? l : r;
+    bool look = node->type == AST_LOOKAHEAD || node->type == AST_NEG_LOOKAHEAD ||
+                node->type == AST_LOOKBEHIND || node->type == AST_NEG_LOOKBEHIND;
+    return d + (look ? 1 : 0);
+}
+
 void program_release(Program* prog) {
     for (int i = 0; i < prog->class_count; i++) class_free(&prog->classes[i]);
     prog->class_count = 0;
+    re_free(&prog->alloc, prog->classes);
+    prog->classes = NULL;
+    prog->class_cap = 0;
+    release_names(prog);
     re_free(&prog->alloc, prog->code);
     prog->code = NULL;
     prog->code_count = 0;
@@ -490,16 +515,16 @@ void program_release(Program* prog) {
 void compile_into(Program* prog, const uint16_t* regex, int flags) {
     /* Only the bookkeeping needs initialisation: code/classes entries are
      * fully written before use and never read past their counts (the code
-     * buffer itself is kept and reused across recompiles); group_names IS
-     * read by name lookups for unnamed groups, so it stays zeroed. Class
+     * buffer and the class slots are kept and reused across recompiles);
+     * the group names are per compile and are dropped. Class
      * range/string buffers are heap-owned (see CharClass in regexp.h), so
      * a re-compile into the same Program must release the previous
      * compile's buffers first -- which also means a Program must be
      * ZERO-initialized (calloc) before its FIRST compile_into, or this
      * loop would free garbage pointers. */
     for (int i = 0; i < prog->class_count; i++) class_free(&prog->classes[i]);
-    memset(prog->group_names, 0, sizeof(prog->group_names));
-    memset(prog->name_chain, 0, sizeof(prog->name_chain));
+    release_names(prog);
+    prog->look_depth = 0;
     prog->code_count = 0;
     prog->class_count = 0;
     prog->group_count = 0;
@@ -531,9 +556,12 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
         }
     }
 
-    if (!prog->error) {
-        NameSet set = {0};
-        validate_group_names(&prog->alloc, ast, &set, &prog->error);
+    /* Nothing to validate unless a group was named; when one was, the
+     * scratch is one array of pointers for the whole AST. */
+    if (!prog->error && prog->name_cap) {
+        const char* names[MAX_GROUPS];
+        int count = 0;
+        validate_group_names(ast, names, &count, &prog->error);
     }
 
     if (!prog->error) {
@@ -556,15 +584,22 @@ void compile_into(Program* prog, const uint16_t* regex, int flags) {
         /* Same-name chains for OP_NAMED_BACKREF (see name_chain in
          * regexp.h); group_names is complete once parsing is done, so this
          * runs before any instruction that consumes the chain is emitted. */
-        for (int i = 1; i <= prog->group_count; i++) {
+        if (prog->name_cap) {
+            prog->name_chain = re_calloc(&prog->alloc, (size_t)prog->name_cap, sizeof(int));
+            if (!prog->name_chain) prog->error = re_oom_error;
+        }
+        for (int i = 1; prog->name_chain && i < prog->name_cap; i++) {
             if (!prog->group_names[i][0]) continue;
-            for (int j = i + 1; j <= prog->group_count; j++) {
+            for (int j = i + 1; j < prog->name_cap; j++) {
                 if (strcmp(prog->group_names[i], prog->group_names[j]) == 0) {
                     prog->name_chain[i] = j;
                     break;
                 }
             }
         }
+        prog->look_depth = look_depth(ast);
+    }
+    if (!prog->error) {
         emit(prog, OP_SAVE, 0, 0, 0, 0, false);
         compile_node(ast, prog, false);
         emit(prog, OP_SAVE, 1, 0, 0, 0, false);

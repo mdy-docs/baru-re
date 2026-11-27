@@ -108,10 +108,9 @@ typedef struct {
 void next_token(Lexer* lexer);
 
 /* ---- Parser (re_parser.c) ------------------------------------------------
- * ASTType/ASTNode/NameSet are shared for the same reason as Lexer/Token
+ * ASTType/ASTNode are shared for the same reason as Lexer/Token
  * above: re_compiler.c's compile_into holds an ASTNode* (parse_alt's
- * result) and constructs a NameSet directly when calling
- * validate_group_names. */
+ * result) and walks it. */
 
 typedef enum {
     AST_LITERAL, AST_CLASS, AST_CONCAT, AST_ALT, AST_GROUP, AST_LOOKAHEAD, AST_NEG_LOOKAHEAD,
@@ -133,11 +132,6 @@ typedef struct ASTNode {
     int depth;
 } ASTNode;
 
-typedef struct {
-    char names[MAX_GROUPS][MAX_GROUP_NAME];
-    int count;
-} NameSet;
-
 /* ---- VM (re_vm.c) --------------------------------------------------------
  * ECMA-262 Canonicalize for the non-Unicode case (simple uppercase mapping
  * with the non-ASCII -> ASCII fold exception). Lives in re_vm.c (it matches
@@ -158,11 +152,13 @@ ASTNode* parse_alt(Lexer* lexer);
  * compiler can check them instead of every node paying for a handle. */
 void free_ast(const RegexAllocator* a, ASTNode* node);
 
-/* Collects every capture group name into out_set, rejecting duplicates
- * within the same alternative (duplicates across mutually-exclusive
- * alternation branches are allowed, per ES2025). Called from re_compiler.c's
- * compile_into as a post-parse validation pass. */
-bool validate_group_names(const RegexAllocator* a, ASTNode* node, NameSet* out_set,
-                          const char** error);
+/* Rejects a capture group name used twice within the same alternative
+ * (duplicates across mutually-exclusive alternation branches are allowed,
+ * per ES2025). `names` is the caller's scratch for MAX_GROUPS name pointers
+ * and *count how many are on it (0 to start); the subtree's distinct names
+ * are left on top, pointing into the AST. Called from re_compiler.c's
+ * compile_into as a post-parse validation pass, and only for a pattern that
+ * names a group -- any other has nothing to check. */
+bool validate_group_names(ASTNode* node, const char** names, int* count, const char** error);
 
 #endif /* RE_INTERNAL_H */

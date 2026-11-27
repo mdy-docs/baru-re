@@ -9,7 +9,7 @@ NFA/DFA-simulation engine like RE2).
 `include/ucd.h` the generated Unicode data. The engine itself is split
 across four `src/re_*.c` files — one per pipeline stage below — plus
 `src/re_internal.h`, a private header (not part of the public API) that
-shares the `Lexer`/`Token`/`ASTNode`/`NameSet` types and a handful of
+shares the `Lexer`/`Token`/`ASTNode` types and a handful of
 cross-stage function declarations (`next_token`, `parse_alt`, `free_ast`,
 `validate_group_names`) between them, since each stage now needs to call
 into the previous one from a different translation unit. This was
@@ -60,9 +60,12 @@ directly from the AST in one recursive walk (`compile_node`,
 typedef struct {
     Instruction* code;                   // heap, grown by emit(); cap MAX_OPCODES
     int code_cap;
-    CharClass classes[MAX_CLASSES];      // 256 small headers; buffers on the heap
-    char group_names[MAX_GROUPS][32];    // 255
-    int name_chain[MAX_GROUPS];          // same-name links for \k<...>
+    CharClass* classes;                  // heap, grown by the lexer; cap MAX_CLASSES
+    int class_cap;
+    char (*group_names)[32];             // heap, only when a group is named
+    int name_cap;                        //   (read through program_group_name)
+    int* name_chain;                     // same-name links for \k<...>, likewise
+    int look_depth;                      // lookaround nesting; sizes a VMContext
     int code_count, class_count, group_count, counter_count;
     bool ignore_case, multiline, dot_all, sticky, unicode, has_indices, unicode_sets;
     bool has_backrefs;                   // gates the VM's fail cache
@@ -72,18 +75,25 @@ typedef struct {
 } Program;
 ```
 
-The struct itself is a ~19KB fixed header (dominated by `group_names` and
-the class slot table); everything that scales with the pattern — the
-instruction array and each class's codepoint ranges and string set — is a
+The struct itself is a ~150-byte header; everything that scales with the
+pattern — the instruction array, the class slots and each class's codepoint
+ranges and string set, the group names — is a
 heap-allocated, right-sized buffer grown on demand during compilation,
 with `MAX_OPCODES`/`MAX_CLASSES`/etc. surviving as hard caps rather than
 allocation sizes. It was ~2MB of embedded fixed-size arrays (a 10-instruction
 pattern paid for 32768; every class paid 16KB of `ranges[2048]`), which
-priced a host out of holding many compiled patterns at once.
+priced a host out of holding many compiled patterns at once; and after
+those, ~19KB of class slots and group names in every `Program`, which with
+the scratch of the name validation (16KB zeroed per AST node) made
+*constructing* a small pattern cost about 90KB of allocation — what a host
+that builds patterns in a loop, or bills its guests for allocation, paid
+for `/a+b/`. The group-name table exists only when the pattern names a
+group and ends at the last named one, so readers go through
+`program_group_name`, which answers `""` for everything else.
 Consequences of heap ownership: a `Program` must be **zero-initialized
 before its first `compile_into`** (`regex_compile` uses `calloc`),
 re-compiling into the same `Program` frees the previous compile's class
-buffers (the code buffer is kept and reused), and teardown must release
+buffers and names (the code buffer and the class slots are kept and reused), and teardown must release
 everything (`regex_free` does; a native host driving `compile_into`
 directly calls the public `program_release`). See `CharClass` in
 `include/regexp.h` for the per-class ownership rules — locally-built
@@ -91,7 +101,8 @@ classes are moved via free-then-struct-assign (`class_free`), and every
 error path that abandons one frees it first.
 (*Matching* allocates a `VMContext` — backtrack stacks, capture arenas,
 fail caches — once per `regex_exec` call, reused across every start
-position; see the VM section below.)
+position, and sized by what the match turns out to need; see the VM
+section below.)
 
 All of `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS`/`MAX_COUNTERS` are
 enforced at their allocation sites (they originally weren't, with
@@ -337,13 +348,15 @@ stack) plus a memoizing fail-cache. All execution scratch lives in a
 `VMContext` (created by the caller once per exec *call*, passed to
 `vm_execute` for every start position tried in that call): one set of
 {backtrack stack, captures arena, fail cache} per lookaround recursion
-depth, allocated lazily on first use at that depth and reused until the
+depth the pattern can reach (`Program.look_depth + 1` of them, in the
+context's own block), allocated lazily on first use at that depth, grown
+as the match needs and reused until the
 context is freed. This replaced allocating and initializing those buffers
 inside every VM entry — which an unanchored search performs once per text
 position — worth roughly two orders of magnitude on scan-heavy
 workloads. The fail cache is
 logically cleared between entries by a generation counter on each entry
-rather than an 8192-slot reset. `vm_execute_internal` survives as a
+rather than a reset of every slot. `vm_execute_internal` survives as a
 one-shot convenience wrapper (create context, run once, free):
 
 ```c
@@ -369,12 +382,17 @@ typedef struct {
   one slice per backtrack-stack slot (the in-flight thread's captures live
   in a separate allocation so arena growth never moves them), and
   every `Thread.captures` points into its own slice. The backtrack stack
-  starts at `VM_STACK_CAPACITY` (512) slots and **doubles on demand up to
-  `VM_STACK_MAX`** (`vm_grow_stack` rebases each slot's arena pointer
-  after the tandem realloc); a match needing more than `VM_STACK_MAX`
-  entries is abandoned as no-match — the greedy-quantifier loop pushes one
+  starts at `VM_STACK_CAPACITY` (16) slots and **doubles on demand up to
+  `VM_STACK_BYTES`** (64MB for a context's stacks together, V8's figure
+  for its own; `vm_context_set_stack_limit` changes it, and
+  `vm_grow_stack` rebases each slot's arena pointer after the tandem
+  realloc); a match needing more is abandoned as one the engine could not
+  finish (`vm_context_budget_exhausted`, with `vm_context_stack_exhausted`
+  to say why), never as no-match, which it used to be and which was a
+  wrong answer — the greedy-quantifier loop pushes one
   backtrack entry per iteration, so this bounds how long a single
-  quantifier run can be, and the pre-growth fixed array with unchecked
+  quantifier run can be (about a million units for a pattern with a group
+  or two), and the pre-growth fixed array with unchecked
   pushes was a confirmed text-driven heap overflow (see `test/smoke.c`'s
   100k-run regression tests). **One consequence
   worth knowing before editing this function:** since a plain struct
@@ -385,10 +403,16 @@ typedef struct {
   next thread off the stack — now goes through a small `thread_copy_state()`
   helper that copies the *data* `.captures` points to explicitly, into the
   destination thread's own already-assigned slice.
-- `fail_cache` (`CacheEntry`, one per context depth slot,
-  `CACHE_SIZE` = 8192, `include/regexp.h:15`) is the ReDoS mitigation:
-  before running a popped thread, `hash_state` (power-of-two mask, not a
-  division) hashes
+- `fail_cache` (`CacheEntry`, one per context depth slot, at most
+  `CACHE_SIZE` = 8192 slots, `include/regexp.h`) is the ReDoS mitigation.
+  A depth has none until a path first fails there; it then starts at
+  `VM_CACHE_START` (64) slots and grows 4x at a time, whenever one VM entry
+  has failed half as many paths as there are slots (`vm_grow_cache`; the
+  old contents are dropped, which costs a re-run and never an answer). It
+  was allocated whole at a depth's first entry — ~200KB, more with
+  counters — which every first match of every pattern paid.
+  Before running a popped thread, `hash_state` (masked to the cache's
+  current power-of-two size, not a division) hashes
   `(pc, sp, counters[])` and checks whether that exact state was already
   tried and failed on *this* VM entry (entries are generation-stamped, so
   "this entry's" failures never leak into the next start position's); if
@@ -419,7 +443,7 @@ typedef struct {
   the innermost loop across all VM entries and lookaround recursion for
   the context's lifetime; backreference compares additionally charge their
   O(capture length) unit-compare work. Exhaustion abandons the in-flight
-  match exactly like the `VM_STACK_MAX` abandon (plain `return false`; all
+  match exactly like the stack limit's abandon (plain `return false`; all
   scratch is context-owned, so the context stays coherent), sets a sticky
   flag readable via `vm_context_budget_exhausted`, and every subsequent
   `vm_run` entry on that context fails immediately. `vm_context_steps_used`

@@ -38,7 +38,7 @@ src/re_lexer.c         scanner + CharClass/Unicode-property construction
 src/re_parser.c        recursive-descent AST builder
 src/re_compiler.c      AST -> bytecode compiler, + compile_into (top-level entry point)
 src/re_vm.c             backtracking VM (vm_execute_internal, vm_get_indices)
-src/re_internal.h      private cross-file types/decls (Lexer/Token/ASTNode/NameSet) -- not public API
+src/re_internal.h      private cross-file types/decls (Lexer/Token/ASTNode) -- not public API
 src/regex_wasm.c      thin WASM shim: opaque handles, UTF-16-in/int32-out
 scripts/generate_ucd.py  regenerates include/ucd.h from unicode.org data
 test/smoke.c           native smoke test (no Emscripten needed)
@@ -75,16 +75,20 @@ reasons in `test/test262.expectations`.
 
 ## Load-bearing constraints — do not violate these silently
 
-- **`Program` is a large fixed-size struct** (`MAX_OPCODES`, `MAX_CLASSES`,
-  `MAX_GROUPS`, `MAX_COUNTERS` in `include/regexp.h` — the one heap-owned
-  exception is each class's string set; see `CharClass`'s ownership rules
-  there), always heap-allocated, never on the stack, **zero-initialized
-  before its first compile**, and **compiled once and reused** across many
-  `regex_exec` calls — don't recompile per match attempt.
+- **`Program` is a small header over heap buffers it owns** (the code, the
+  class slots and each class's ranges and strings, the group names; capped
+  by `MAX_OPCODES`, `MAX_CLASSES`, `MAX_GROUPS`, `MAX_COUNTERS` in
+  `include/regexp.h` — see `CharClass`'s ownership rules
+  there). It must be **zero-initialized
+  before its first compile**, released with `program_release`, and
+  **compiled once and reused** across many
+  `regex_exec` calls — don't recompile per match attempt. Read group names
+  through `program_group_name`: the table is absent when nothing is named.
+  A `VMContext` belongs to the `Program` as compiled when it was created.
 - **All of those `MAX_*` bounds are now enforced at compile time** (they
   weren't originally — exceeding one was confirmed memory corruption):
   exceeding one sets `prog->error` and fails compilation
-  cleanly instead of overflowing a fixed-size array. If you add a new
+  cleanly instead of overflowing a buffer. If you add a new
   allocation site against any of these arrays, follow the same
   check-before-index pattern used at every existing site — the bound
   being enforced elsewhere won't protect your new site.

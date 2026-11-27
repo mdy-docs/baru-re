@@ -134,11 +134,12 @@ Notes:
   `compile_into` has no length parameter — it scans for `\0`). `text`
   passed to `regex_exec` does *not* need NUL-termination; `text_units` is
   authoritative there.
-- A compiled `Program` is a small fixed header (~19KB) plus right-sized
-  heap buffers for the instruction array and each character class's
-  range/string sets — `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS` in
+- A compiled `Program` is a small fixed header (~150 bytes) plus right-sized
+  heap buffers for the instruction array, the character classes and their
+  range/string sets, and the group names when there are any —
+  `MAX_OPCODES`/`MAX_CLASSES`/`MAX_GROUPS` in
   `regexp.h` are hard caps, not allocation sizes. A typical pattern costs
-  a few KB of buffers. Still: **compile once per distinct pattern and
+  a few KB of buffers, and matching it a few hundred bytes more. Still: **compile once per distinct pattern and
   reuse the handle** across many `regex_exec` calls — don't recompile per
   match attempt (and note each *executed* handle also holds its reusable
   VM scratch, ~160KB, until freed).
@@ -177,7 +178,10 @@ Notes:
   `vm_context_budget_exhausted` on their `VMContext` — see the comment in
   `include/regexp.h` for sizing guidance. `vm_context_steps_used` reports
   what a match actually spent (for a host that bills it to a budget of its
-  own), and `vm_context_set_interrupt` gives the VM a host flag to poll
+  own), `vm_context_set_stack_limit` bounds the backtrack stack in bytes
+  (64MB by default; a match that needs more is reported as exhausted, and
+  `vm_context_stack_exhausted` says that is why), and
+  `vm_context_set_interrupt` gives the VM a host flag to poll
   every 4096 steps, so a long match can be stopped from outside;
   `vm_context_interrupted` tells that apart from an exhausted budget.
 

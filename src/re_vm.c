@@ -25,6 +25,7 @@
  * CLAUDE.md/README.md's "Provenance" section for why that diverges from
  * upstream's layout.
  */
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -133,8 +134,8 @@ uint32_t annexb_canonicalize(uint32_t ch) {
 
 /* `gen` implements O(1) logical clearing: an entry counts as present only
  * if its gen matches the owning VMDepth's current generation, so "clearing"
- * the 8192-entry cache between VM entries is one integer increment instead
- * of an 8192-iteration reset -- that reset used to run once per *start
+ * the cache between VM entries is one integer increment instead
+ * of a reset of every entry -- that reset used to run once per *start
  * position* of an unanchored search. */
 typedef struct { int pc; const uint16_t* sp; unsigned int gen; } CacheEntry;
 
@@ -182,12 +183,19 @@ typedef struct {
     int pc; const uint16_t* sp; const uint16_t** captures; int* counters; const uint16_t** counter_sp;
 } Thread;
 
-static inline unsigned int hash_state(const Thread* t, int counter_count) {
-    unsigned int h = (unsigned int)((t->pc * 31) + (size_t)t->sp);
+/* The whole hash: the caller masks it to the cache's current size (always a
+ * power of two, so masking replaces the division a true % would need -- this
+ * runs once per backtrack-stack pop), and a failed path's entry is stored by
+ * masking the same value again, since the cache may have grown meanwhile.
+ * The position goes in as an offset into the subject, not as an address: an
+ * address made which states collide, and so how many steps a match takes,
+ * depend on where the subject happened to be allocated -- a host that
+ * charges for steps then charges one script two prices on two runs -- and
+ * its low bit is always clear, which left the hash half its spread. */
+static inline unsigned int hash_state(const Thread* t, int counter_count, const uint16_t* text) {
+    unsigned int h = (unsigned int)(t->pc * 31) + (unsigned int)(t->sp - text);
     for (int i = 0; i < counter_count; i++) h ^= (t->counters[i] * 73);
-    /* CACHE_SIZE is a power of two, so masking replaces the division a
-     * true % would need -- this runs once per backtrack-stack pop. */
-    return h & (CACHE_SIZE - 1);
+    return h;
 }
 
 /* Copies src's pc/sp/counters/counter_sp, and the *data* src->captures
@@ -209,39 +217,40 @@ static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pai
     }
 }
 
-#define VM_STACK_CAPACITY 512
-/* Hard ceiling for backtrack-stack growth. The greedy-quantifier loop
- * (OP_CHECK_COUNTER) pushes one backtrack entry per iteration, so a single
- * quantifier matching a run of N units needs N live entries -- the stack
- * was a fixed Thread[512] with UNCHECKED pushes, meaning e.g. [a-z]+
+/* Where the backtrack stack starts. It was 512 entries (28KB and up), which
+ * a host that matches many small patterns paid at the first match of each;
+ * most matches never have more than a handful of threads pending, and the
+ * ones that do double their way up in a few steps. */
+#define VM_STACK_CAPACITY 16
+/* Where the fail cache starts, at a depth's first failed path; it grows by
+ * 4x up to CACHE_SIZE as failures accumulate (see vm_grow_cache). Both are
+ * powers of two. */
+#define VM_CACHE_START 64
+/* What a context's backtrack stacks may hold, all depths together, unless
+ * the host says otherwise (vm_context_set_stack_limit). The greedy-quantifier
+ * loop (OP_CHECK_COUNTER) pushes one backtrack entry per iteration, so a
+ * single quantifier matching a run of N units needs N live entries -- the
+ * stack was a fixed Thread[512] with UNCHECKED pushes, meaning e.g. [a-z]+
  * against 600 consecutive letters wrote past its end (confirmed via ASan:
  * heap-buffer-overflow in thread_copy_state -- a text-driven memory-safety
- * bug, unlike the pattern-driven MAX_* overflow class). The
- * stack now doubles on demand up to this many entries; a match needing
- * more is abandoned as no-match (a documented engine limit, like
- * MAX_GROUPS -- there's no error channel on the exec path) rather than
- * corrupting memory.
+ * bug, unlike the pattern-driven MAX_* overflow class). The stack now grows
+ * on demand up to this many bytes, and a match needing more is abandoned as
+ * one the engine could not finish (vm_context_stack_exhausted), which is
+ * what V8 does at the same figure for its own backtrack stack (a RangeError
+ * there).
  *
- * Worst-case bytes at the cap scale with the PATTERN, not just this
- * constant: each entry costs sizeof(Thread) (40B) plus its arena slices --
- * 8B per capture slot (cap_pairs = 2*(groups+1)) and 12B per counter. A
- * typical few-group pattern is ~100B/entry, so 2^19 entries top out around
- * 50MB, transient and tolerable even under WASM's default heap. A
- * pathological pattern near the MAX_GROUPS/MAX_COUNTERS ceilings could in
- * principle multiply that toward single-digit GBs before the entry cap
- * bites -- reaching 2^19 live entries additionally requires a
- * quantifier-driven subject in the hundreds of thousands of units, and
- * allocation failure remains a clean fatal exit, but an embedder wanting a
- * hard BYTE bound for adversarial pattern+subject pairs should derive the
- * cap from per-entry cost rather than rely on this constant alone (the
- * step budget usually intervenes first: every backtrack entry implies
- * dispatched instructions). */
-#define VM_STACK_MAX (1 << 19)
+ * The bound was a count of entries (2^19), and reaching it read as "no
+ * match": /^[a-z]+$/ answered false for 600,000 letters, a wrong answer and
+ * not a limit anyone could see. It is bytes because an entry's size is the
+ * pattern's -- sizeof(Thread) (40B) plus 8B per capture slot (cap_pairs =
+ * 2*(groups+1)) and 12B per counter -- so a count bounded a few-group
+ * pattern at ~50MB and one near MAX_GROUPS/MAX_COUNTERS at gigabytes. */
+#define VM_STACK_BYTES ((size_t)64 << 20)
 
 /* Per-recursion-depth execution scratch. Lookaround runs the VM
  * recursively, and a nested run can't share the outer run's backtrack
- * stack or fail cache -- so each depth owns a set, allocated on first use
- * and kept for the context's lifetime. */
+ * stack or fail cache -- so each depth owns a set, allocated on first use,
+ * grown as matching needs and kept for the context's lifetime. */
 typedef struct {
     Thread* stack;
     const uint16_t** arena;            /* stack slots' capture slices */
@@ -273,6 +282,9 @@ typedef struct {
      * right-sizing. */
     int* cache_counters;
     const uint16_t** cache_counter_sp;
+    /* Slots in cache (and its two side arrays): 0 until a path first fails
+     * at this depth, then a power of two up to CACHE_SIZE. */
+    int cache_size;
     int capacity;
     unsigned int gen; /* current fail-cache generation, see CacheEntry */
 } VMDepth;
@@ -280,9 +292,12 @@ typedef struct {
 /* Reusable scratch for every VM entry within one exec call -- see
  * regexp.h's comment for why this exists (per-start-position allocation +
  * fail-cache initialization used to dominate unanchored searches by
- * orders of magnitude). depth[] is indexed by lookaround recursion depth;
- * MAX_AST_DEPTH bounds it because every lookaround level costs at least
- * one AST level, which the parser caps (MAX_AST_DEPTH, regexp.h). */
+ * orders of magnitude). depth[] is indexed by lookaround recursion depth
+ * and has one entry per level the pattern can reach (Program.look_depth + 1,
+ * so one for a pattern without lookarounds): it was MAX_AST_DEPTH entries,
+ * 42KB zeroed for every context whatever the pattern. The entries are part
+ * of the context's own block because vm_run holds a pointer to its depth's
+ * across the recursive entries: they must not move. */
 struct VMContext {
     int cap_pairs;
     /* Step budget (see regexp.h): counts every instruction executed through
@@ -308,19 +323,30 @@ struct VMContext {
      * others still NULL), and nothing repairs it -- so once this is set the
      * context must never enter the VM again, re-arm or not. */
     bool oom;
+    /* The backtrack stacks' bytes, every depth's together, the most they may
+     * come to, and whether a match wanted more. That last sets
+     * budget_exhausted with it, as an interrupt does, so the context refuses
+     * the rest of a scan loop and a re-arm clears both. */
+    size_t stack_bytes;
+    size_t stack_limit;
+    bool stack_exhausted;
     /* Copied from the Program at creation, not borrowed by pointer: a
      * context outlives no Program in practice, but a copy costs two words
      * and removes the question entirely. Every buffer below is allocated
      * and freed through it. */
     RegexAllocator alloc;
-    VMDepth depth[MAX_AST_DEPTH];
+    int depth_count;
+    VMDepth depth[];
 };
 
 VMContext* vm_context_new(const Program* prog) {
-    VMContext* ctx = re_calloc(&prog->alloc, 1, sizeof(VMContext));
+    int depths = prog->look_depth + 1;
+    VMContext* ctx = re_calloc(&prog->alloc, 1, sizeof(VMContext) + sizeof(VMDepth) * (size_t)depths);
     if (!ctx) return NULL;
     ctx->cap_pairs = (prog->group_count + 1) * 2;
     ctx->alloc = prog->alloc;
+    ctx->depth_count = depths;
+    ctx->stack_limit = VM_STACK_BYTES;
     return ctx;
 }
 
@@ -329,6 +355,19 @@ void vm_context_set_step_budget(VMContext* ctx, uint64_t max_steps) {
     ctx->steps_used = 0;
     ctx->budget_exhausted = false;
     ctx->interrupted = false;
+    ctx->stack_exhausted = false;
+}
+
+void vm_context_set_stack_limit(VMContext* ctx, size_t max_bytes) {
+    ctx->stack_limit = max_bytes;
+}
+
+size_t vm_context_stack_bytes(const VMContext* ctx) {
+    return ctx->stack_bytes;
+}
+
+bool vm_context_stack_exhausted(const VMContext* ctx) {
+    return ctx->stack_exhausted;
 }
 
 uint64_t vm_context_steps_used(const VMContext* ctx) {
@@ -352,7 +391,7 @@ void vm_context_free(VMContext* ctx) {
     /* By value: the last re_free below releases the struct this handle
      * lives in. */
     const RegexAllocator a = ctx->alloc;
-    for (int i = 0; i < MAX_AST_DEPTH; i++) {
+    for (int i = 0; i < ctx->depth_count; i++) {
         re_free(&a, ctx->depth[i].stack);
         re_free(&a, (void*)ctx->depth[i].arena);
         re_free(&a, (void*)ctx->depth[i].current_captures);
@@ -369,6 +408,11 @@ void vm_context_free(VMContext* ctx) {
     re_free(&a, ctx);
 }
 
+/* What one backtrack entry takes: the Thread and its slices of the arenas. */
+static size_t vm_entry_bytes(int cap_pairs, int cc) {
+    return sizeof(Thread) + sizeof(uint16_t*) * (size_t)cap_pairs + (sizeof(int) + sizeof(uint16_t*)) * (size_t)cc;
+}
+
 /* Doubles the backtrack stack and its captures arena in tandem. Every
  * stack slot's .captures points into the arena at a fixed stride, so a
  * realloc that moves the arena invalidates all of them -- they're rebased
@@ -376,13 +420,23 @@ void vm_context_free(VMContext* ctx) {
  * with the realloc and stays valid; it's only the slot->arena pointers
  * that need recomputing. The in-flight thread's captures live in their
  * own allocation, not the arena, precisely so growth never moves them.)
- * Returns false at VM_STACK_MAX and on allocation failure; the latter also
- * sets ctx->oom, so the host hears "gave up" rather than "no match". Either
- * way every buffer that DID grow is stored back into the VMDepth before
- * returning, so nothing is leaked and the context stays freeable. */
+ * Returns false at the context's byte limit and on allocation failure, and
+ * either way the host hears "gave up" rather than "no match": the limit
+ * through stack_exhausted, which leaves the context usable, a failure
+ * through ctx->oom, which does not. The last growth before the limit is
+ * what still fits rather than a doubling, so the limit is the bound and not
+ * some power of two below it. Every buffer that DID grow is stored back
+ * into the VMDepth before returning, so nothing is leaked and the context
+ * stays freeable. */
 static bool vm_grow_stack(VMContext* ctx, VMDepth* d, int cap_pairs, int cc) {
-    if (d->capacity >= VM_STACK_MAX) return false;
-    int new_capacity = d->capacity * 2;
+    size_t entry = vm_entry_bytes(cap_pairs, cc);
+    size_t room = ctx->stack_bytes < ctx->stack_limit ? (ctx->stack_limit - ctx->stack_bytes) / entry : 0;
+    /* the capacity is an int, whatever limit a host set */
+    if (room == 0 || d->capacity > INT_MAX / 2) {
+        ctx->budget_exhausted = ctx->stack_exhausted = true;
+        return false;
+    }
+    int new_capacity = room < (size_t)d->capacity ? d->capacity + (int)room : d->capacity * 2;
     Thread* new_stack = re_realloc(&ctx->alloc, d->stack, sizeof(Thread) * (size_t)new_capacity);
     if (new_stack) d->stack = new_stack;
     const uint16_t** new_arena = re_realloc(&ctx->alloc, (void*)d->arena, sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)new_capacity);
@@ -412,13 +466,58 @@ static bool vm_grow_stack(VMContext* ctx, VMDepth* d, int cap_pairs, int cc) {
     }
     d->stack = new_stack;
     d->arena = new_arena;
+    ctx->stack_bytes += entry * (size_t)(new_capacity - d->capacity);
     d->capacity = new_capacity;
+    return true;
+}
+
+/* Gives a depth its fail cache, or a larger one: VM_CACHE_START slots at
+ * the first failed path, then 4x at a time up to CACHE_SIZE. The cache was
+ * allocated whole (CACHE_SIZE slots, ~200KB, plus 12 bytes per counter per
+ * slot) and cleared at a depth's first entry, which a match that fails a
+ * handful of paths -- nearly every match -- paid for nothing. What the old
+ * cache held is dropped, not rehashed: an entry only spares re-running a
+ * path already known to fail, so losing one costs time and never an answer,
+ * and a depth outgrows its cache at most four times in a context's life.
+ * An allocation failure is the context's, like the stack's: the match is
+ * abandoned and reported as one that could not be finished. */
+static bool vm_grow_cache(VMContext* ctx, VMDepth* d, int cc) {
+    int size = d->cache_size ? d->cache_size * 4 : VM_CACHE_START;
+    if (size > CACHE_SIZE) size = CACHE_SIZE;
+    /* Zeroed: gen 0 marks an entry stale forever; real generations start at 1. */
+    CacheEntry* cache = re_calloc(&ctx->alloc, (size_t)size, sizeof(CacheEntry));
+    int* counters = NULL;
+    const uint16_t** counter_sp = NULL;
+    if (cc > 0) {
+        counters = re_alloc(&ctx->alloc, sizeof(int) * (size_t)cc * (size_t)size);
+        counter_sp = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cc * (size_t)size);
+    }
+    if (!cache || (cc > 0 && (!counters || !counter_sp))) {
+        re_free(&ctx->alloc, cache);
+        re_free(&ctx->alloc, counters);
+        re_free(&ctx->alloc, (void*)counter_sp);
+        ctx->oom = true;
+        return false;
+    }
+    re_free(&ctx->alloc, d->cache);
+    re_free(&ctx->alloc, d->cache_counters);
+    re_free(&ctx->alloc, (void*)d->cache_counter_sp);
+    d->cache = cache;
+    d->cache_counters = counters;
+    d->cache_counter_sp = counter_sp;
+    d->cache_size = size;
     return true;
 }
 
 static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
     int cap_pairs = ctx->cap_pairs;
-    if (depth >= MAX_AST_DEPTH) return false; /* unreachable: the parser caps nesting */
+    /* Unreachable with the Program the context was created for (its
+     * look_depth sized depth[]); with any other, refusing is the only safe
+     * answer, and it must not read as "no match". */
+    if (depth >= ctx->depth_count) {
+        ctx->oom = true;
+        return false;
+    }
     /* Sticky budget check: once exhausted, every further entry (the scan
      * loop's next start position, an outer thread retrying a lookaround)
      * fails immediately instead of re-arming the counter. ctx->oom is
@@ -436,18 +535,15 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
         d->capacity = VM_STACK_CAPACITY;
         d->arena = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cap_pairs * (size_t)d->capacity);
         d->stack = re_alloc(&ctx->alloc, sizeof(Thread) * (size_t)d->capacity);
-        d->cache = re_alloc(&ctx->alloc, sizeof(CacheEntry) * CACHE_SIZE);
         d->current_captures = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cap_pairs);
         if (cc > 0) {
-            d->cache_counters = re_alloc(&ctx->alloc, sizeof(int) * (size_t)cc * CACHE_SIZE);
-            d->cache_counter_sp = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cc * CACHE_SIZE);
             d->counters_arena = re_alloc(&ctx->alloc, sizeof(int) * (size_t)cc * (size_t)d->capacity);
             d->counter_sp_arena = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cc * (size_t)d->capacity);
             d->current_counters = re_alloc(&ctx->alloc, sizeof(int) * (size_t)cc);
             d->current_counter_sp = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cc);
             d->path_counters = re_alloc(&ctx->alloc, sizeof(int) * (size_t)cc);
             d->path_counter_sp = re_alloc(&ctx->alloc, sizeof(uint16_t*) * (size_t)cc);
-            if (!d->cache_counters || !d->cache_counter_sp || !d->counters_arena ||
+            if (!d->counters_arena ||
                 !d->counter_sp_arena || !d->current_counters || !d->current_counter_sp ||
                 !d->path_counters || !d->path_counter_sp) {
                 ctx->oom = true;
@@ -458,28 +554,36 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
          * vm_context_free to release; leaving this depth half-initialized
          * is safe only because ctx->oom locks the context out of the VM for
          * good, so no later entry can reach the buffers still NULL here. */
-        if (!d->arena || !d->stack || !d->cache || !d->current_captures) {
+        if (!d->arena || !d->stack || !d->current_captures) {
             ctx->oom = true;
             return false;
         }
+        /* a depth's first entries are given whatever the limit: it bounds growth */
+        ctx->stack_bytes += vm_entry_bytes(cap_pairs, cc) * (size_t)d->capacity;
         for (int i = 0; i < d->capacity; i++) {
             d->stack[i].captures = d->arena + (size_t)i * cap_pairs;
             d->stack[i].counters = cc > 0 ? d->counters_arena + (size_t)i * cc : NULL;
             d->stack[i].counter_sp = cc > 0 ? d->counter_sp_arena + (size_t)i * cc : NULL;
         }
-        /* gen 0 marks every entry stale forever; real generations start at 1. */
-        for (int i = 0; i < CACHE_SIZE; i++) d->cache[i].gen = 0;
         d->gen = 0;
     }
     if (++d->gen == 0) {
         /* Generation wrapped (2^32 entries at one depth in one context) --
          * hard-reset so gen-0 entries can't masquerade as current. */
-        for (int i = 0; i < CACHE_SIZE; i++) d->cache[i].gen = 0;
+        for (int i = 0; i < d->cache_size; i++) d->cache[i].gen = 0;
         d->gen = 1;
     }
     const unsigned int gen = d->gen;
     Thread* stack = d->stack;
+    /* The depth's cache as this entry sees it. Only this entry changes it
+     * while it runs (a lookaround's entry works at the next depth), so the
+     * loop below reads these and not the depth's fields. */
     CacheEntry* fail_cache = d->cache;
+    int cache_size = d->cache_size;
+    /* The paths that have failed in this entry since the cache was last
+     * sized: what decides when it grows (see the store below). Counted per
+     * entry because an earlier entry's are a generation old, and dead. */
+    int cache_stores = 0;
     int stack_capacity = d->capacity;
     int stack_ptr = 0;
 
@@ -502,17 +606,22 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
         stack_ptr--;
         thread_copy_state(&current, &stack[stack_ptr], cap_pairs, cc);
 
-        unsigned int h = 0;
+        unsigned int path_hash = 0;
         /* Snapshot the popped state's counters (into d->path_counters):
          * they mutate as the path below executes, and the entry stored on
          * failure must key the state the path STARTED from -- pc/sp get
-         * the same treatment via path_start_pc/path_start_sp. */
+         * the same treatment via path_start_pc/path_start_sp, and the hash
+         * by being taken here. Nothing has failed at this depth while there
+         * is no cache, so there is nothing to look up. */
         if (use_cache) {
-            h = hash_state(&current, cc);
-            if (fail_cache[h].gen == gen && fail_cache[h].pc == current.pc && fail_cache[h].sp == current.sp &&
-                (cc == 0 || (memcmp(d->cache_counters + (size_t)h * cc, current.counters, sizeof(int) * (size_t)cc) == 0 &&
-                             memcmp(d->cache_counter_sp + (size_t)h * cc, current.counter_sp, sizeof(const uint16_t*) * (size_t)cc) == 0)))
-                continue;
+            path_hash = hash_state(&current, cc, original_text);
+            if (cache_size) {
+                unsigned int h = path_hash & (unsigned int)(cache_size - 1);
+                if (fail_cache[h].gen == gen && fail_cache[h].pc == current.pc && fail_cache[h].sp == current.sp &&
+                    (cc == 0 || (memcmp(d->cache_counters + (size_t)h * cc, current.counters, sizeof(int) * (size_t)cc) == 0 &&
+                                 memcmp(d->cache_counter_sp + (size_t)h * cc, current.counter_sp, sizeof(const uint16_t*) * (size_t)cc) == 0)))
+                    continue;
+            }
             if (cc > 0) {
                 memcpy(d->path_counters, current.counters, sizeof(int) * (size_t)cc);
                 memcpy((void*)d->path_counter_sp, current.counter_sp, sizeof(const uint16_t*) * (size_t)cc);
@@ -523,7 +632,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
 
         while (true) {
             /* One step = one instruction dispatch. Abandoning mid-path is
-             * safe for the same reason the VM_STACK_MAX abandon is: all
+             * safe for the same reason the stack limit's abandon is: all
              * scratch is context-owned and (re)initialized per entry, so a
              * plain return leaves the context reusable. */
             if (ctx->step_budget) {
@@ -780,8 +889,8 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                 current.pc++;
             } break;
             case OP_SPLIT: {
-                /* Every push site checks capacity first; hitting VM_STACK_MAX
-                 * abandons the whole match (see the define above). Growth
+                /* Every push site checks capacity first; hitting the stack
+                 * limit abandons the whole match (see VM_STACK_BYTES). Growth
                  * reallocates through the VMDepth, so refresh the locals. */
                 if (stack_ptr == stack_capacity) {
                     if (!vm_grow_stack(ctx, d, cap_pairs, cc)) return false;
@@ -854,6 +963,18 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
             if (path_failed) break;
         }
         if (use_cache && path_failed) {
+            /* Grown once this entry has failed half as many paths as there
+             * are slots: a direct-mapped cache much fuller than that evicts
+             * what it is about to be asked for. The first failure finds no
+             * cache and makes one. */
+            if (cache_stores * 2 >= cache_size && cache_size < CACHE_SIZE) {
+                if (!vm_grow_cache(ctx, d, cc)) return false;
+                fail_cache = d->cache;
+                cache_size = d->cache_size;
+                cache_stores = 0;
+            }
+            unsigned int h = path_hash & (unsigned int)(cache_size - 1);
+            cache_stores++;
             fail_cache[h].pc = path_start_pc; fail_cache[h].sp = path_start_sp; fail_cache[h].gen = gen;
             if (cc > 0) {
                 memcpy(d->cache_counters + (size_t)h * cc, d->path_counters, sizeof(int) * (size_t)cc);
