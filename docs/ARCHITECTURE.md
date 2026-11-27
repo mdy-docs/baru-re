@@ -242,7 +242,22 @@ duration of the body's compile walk (the parser does the equivalent
 toggle around the body's *lex*, for `.` and classes, which are built at
 lex time). A few more things worth knowing before you touch this:
 
-- **Quantifiers compile to a counter loop, not unrolled repetition.**
+- **A greedy quantifier over one unit compiles to a run.** Where the
+  body is one literal or one class (`a+`, `[a-z]*`, `.{2,5}`, `\p{L}+`,
+  and the same inside non-capturing groups that only wrap it; not a lazy
+  quantifier, a capture, a group with flags or a `/v` class with
+  strings), `AST_QUANTIFIER` emits a single `OP_CHAR_RUN` or
+  `OP_CLASS_RUN` carrying the unit's operands and `min`/`max`, and uses
+  no counter. The VM (`vm_scan_run`) takes every repetition it can in
+  one go and saves **one** backtrack entry for the whole run, which
+  holds how far the run may still be given back (`Thread.run`) and gives
+  back one repetition each time it is taken up again: the same attempts
+  in the same order as the loop below would make, longest first, without
+  an entry per repetition. This is what lets `[a-z]+` or `.*` cross
+  millions of units on the stack a context begins with, where the loop
+  needs 64MB at about a million.
+- **Every other quantifier compiles to a counter loop, not unrolled
+  repetition.**
   `AST_QUANTIFIER` (`re_compiler.c:233`) emits `OP_INIT_COUNTER` /
   `OP_CHECK_COUNTER` / `OP_CLEAR_CAPTURES` (resetting the captures of
   groups defined inside the body at the top of each iteration, per
@@ -336,6 +351,7 @@ lex time). A few more things worth knowing before you touch this:
 | `OP_LOOKAHEAD`/`OP_NEG_LOOKAHEAD`/`OP_LOOKBEHIND`/`OP_NEG_LOOKBEHIND` | recursive sub-match, no `sp` consumption on success |
 | `OP_MATCH` | success (top-level or lookaround-subroutine) |
 | `OP_INIT_COUNTER`/`OP_INC_COUNTER`/`OP_CHECK_COUNTER` | bounded-repetition loop control |
+| `OP_CHAR_RUN`, `OP_CLASS_RUN` | a greedy quantifier over one literal / class as one instruction: `arg1`/`arg2` as `OP_CHAR`'s or `OP_CLASS`'s, `arg3` the most repetitions (-1 for no bound), `arg4` the fewest; one backtrack entry for the whole run |
 | `OP_ASSERT_START`/`OP_ASSERT_END` | `^`/`$` (multiline baked into `arg1`) |
 | `OP_BACKREF`/`OP_NAMED_BACKREF` | match previously captured text (numeric id baked in / re-resolved by name at match time for ES2025 duplicate names) |
 | `OP_WORD_BOUNDARY`/`OP_NON_WORD_BOUNDARY` | `\b`/`\B` (`arg1` = effective ignoreCase; under `/iu` the word set folds, adding U+017F/U+212A) |
@@ -390,9 +406,11 @@ typedef struct {
   finish (`vm_context_budget_exhausted`, with `vm_context_stack_exhausted`
   to say why), never as no-match, which it used to be and which was a
   wrong answer — the greedy-quantifier loop pushes one
-  backtrack entry per iteration, so this bounds how long a single
-  quantifier run can be (about a million units for a pattern with a group
-  or two), and the pre-growth fixed array with unchecked
+  backtrack entry per iteration, so this bounds how many times a
+  quantifier over a group, a capture or more than one unit can repeat
+  (about a million for a pattern with a group or two; a quantifier over
+  one literal or class is a run, which holds one entry however long it
+  is), and the pre-growth fixed array with unchecked
   pushes was a confirmed text-driven heap overflow (see `test/smoke.c`'s
   100k-run regression tests). **One consequence
   worth knowing before editing this function:** since a plain struct
@@ -442,7 +460,13 @@ typedef struct {
   enforcement regresses). One step = one instruction dispatch, counted in
   the innermost loop across all VM entries and lookaround recursion for
   the context's lifetime; backreference compares additionally charge their
-  O(capture length) unit-compare work. Exhaustion abandons the in-flight
+  O(capture length) unit-compare work, and a run (`OP_CHAR_RUN`,
+  `OP_CLASS_RUN`) a step for each repetition it takes, counted as it goes
+  so that a budget or an interrupt stops it inside a long run, and one
+  for each it gives back. That keeps a step worth about the same time
+  wherever it is spent (3.5 to 12 ns on a 2.6 GHz x86-64), which a host
+  that prices steps relies on; the loop a run replaces took four steps a
+  repetition, so the same match now reports fewer. Exhaustion abandons the in-flight
   match exactly like the stack limit's abandon (plain `return false`; all
   scratch is context-owned, so the context stays coherent), sets a sticky
   flag readable via `vm_context_budget_exhausted`, and every subsequent
@@ -459,13 +483,24 @@ typedef struct {
   sequential compares;
   each case's `path_failed = true; break;` idiom breaks the switch, and
   the `if (path_failed) break;` after it completes the loop exit.
-- `OP_CHAR`/`OP_CLASS`/backreference matching each have a `step > 0` branch
+- Backreference matching has a `step > 0` branch
   (forward, used for normal matching and lookahead) and a `step <= 0`
   branch (backward, used for lookbehind) implementing the matching logic
   side by side — the surrogate decoding itself is shared
   (`decode_utf16`/`decode_utf16_backward`), but the case-folding and
   bounds logic around it is still per-branch; check the mirror branch
-  when fixing either side.
+  when fixing either side. The test of one unit is `match_unit`, one
+  function for `OP_CHAR`, `OP_CLASS` and the two runs in both
+  directions, so those cannot drift apart. It is forced inline and
+  `vm_scan_run` forced out of line (`VM_INLINE`/`VM_NOINLINE`), and both
+  are measured choices: `vm_run` has more live values than x86-64 has
+  registers, so a run's loop inside it keeps its position in memory
+  (4.7 ns a unit against 3.5 in a function of its own), and a call for
+  each `OP_CHAR` costs the dispatch loop 5 to 10%.
+- A backreference under `/u` compares code points: where the units
+  match but the reading stops between the two halves of a surrogate pair
+  (a capture that is a lone lead, repeated by the first half of a pair)
+  it is no match.
 - `is_word_char_fold` (`re_vm.c:92`) is the `\b`/`\B` word-character
   test: plain ASCII `[a-zA-Z0-9_]`, widened via `unicode_casefold` when
   the instruction's baked-in ignoreCase bit *and* `prog->unicode` are

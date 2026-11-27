@@ -105,15 +105,19 @@ typedef struct {
 typedef enum {
     OP_CHAR, OP_CLASS, OP_SPLIT, OP_JMP, OP_SAVE, OP_LOOKAHEAD, OP_NEG_LOOKAHEAD, OP_MATCH,
     OP_INIT_COUNTER, OP_INC_COUNTER, OP_CHECK_COUNTER, OP_ASSERT_START, OP_ASSERT_END, OP_BACKREF, OP_NAMED_BACKREF, OP_WORD_BOUNDARY,
-    OP_NON_WORD_BOUNDARY, OP_LOOKBEHIND, OP_NEG_LOOKBEHIND, OP_CLEAR_CAPTURES
+    OP_NON_WORD_BOUNDARY, OP_LOOKBEHIND, OP_NEG_LOOKBEHIND, OP_CLEAR_CAPTURES,
+    /* A greedy quantifier over one literal or one class, the whole loop in an
+     * instruction: arg1 (and arg2) as OP_CHAR's or OP_CLASS's, arg3 the most
+     * repetitions (-1 for no bound), arg4 the fewest. See re_vm.c. */
+    OP_CHAR_RUN, OP_CLASS_RUN
 } RegexOpCode;
 
 typedef struct {
     RegexOpCode op;
     int arg1;
     int arg2;
-    int arg3;  // Max bounds for OP_CHECK_COUNTER
-    int arg4;  // Jump target for OP_CHECK_COUNTER
+    int arg3;  // Max bounds for OP_CHECK_COUNTER and the runs
+    int arg4;  // Jump target for OP_CHECK_COUNTER; min bounds for the runs
     bool lazy; // Lazy routing flag
 } Instruction;
 
@@ -295,7 +299,9 @@ void vm_context_free(VMContext* ctx);
 
 /* Hard step budget: the maximum number of VM instructions this context may
  * execute across every vm_execute entry (including lookaround recursion)
- * for the context's whole lifetime. 0 (the default) means unlimited --
+ * for the context's whole lifetime, where a run (OP_CHAR_RUN, OP_CLASS_RUN)
+ * counts one for each repetition it takes and each it gives back, and a
+ * backreference one for each unit it compares. 0 (the default) means unlimited --
  * existing consumers are unaffected unless they opt in. When the budget is
  * exhausted the in-flight match is abandoned (vm_execute returns false)
  * and vm_context_budget_exhausted() reports
@@ -320,8 +326,11 @@ void vm_context_set_step_budget(VMContext* ctx, uint64_t max_steps);
 bool vm_context_budget_exhausted(const VMContext* ctx);
 
 /* The backtrack stack's bound. A greedy loop saves one entry per iteration, so a long enough
- * run of matching text needs a deep stack; a context's stacks (one per lookaround depth) may
- * come to max_bytes together, 64MB unless set here, which is V8's figure for its own. A match
+ * stretch of matching text needs a deep stack (a quantifier over one literal or one class is
+ * not a loop but a run, OP_CHAR_RUN or OP_CLASS_RUN, and saves one entry however long it is:
+ * this is about quantifiers over groups, captures and bodies of several units); a context's
+ * stacks (one per lookaround depth) may come to max_bytes together, 64MB unless set here,
+ * which is V8's figure for its own. A match
  * that needs more is abandoned as an exhausted budget abandons it -- vm_execute returns false
  * and vm_context_budget_exhausted reports true, because "no match" would be a wrong answer --
  * and vm_context_stack_exhausted tells the two apart (V8 throws a RangeError here). The state

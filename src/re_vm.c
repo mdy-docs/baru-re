@@ -37,6 +37,21 @@
 
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
+/* The test of one unit (match_unit) is inlined where it is used and the scan
+ * of a run (vm_scan_run) is not, and neither is left to the compiler's
+ * judgment: vm_run is one function with more live values than x86-64 has
+ * registers, so a loop inside it keeps its position in memory and pays a
+ * store and a load for every unit (measured: 4.7 ns a unit there, 3.5 in a
+ * function of its own), and a call for each OP_CHAR and OP_CLASS costs the
+ * dispatch loop 5 to 10%. */
+#if defined(__GNUC__) || defined(__clang__)
+#define VM_INLINE static inline __attribute__((always_inline))
+#define VM_NOINLINE static __attribute__((noinline))
+#else
+#define VM_INLINE static inline
+#define VM_NOINLINE static
+#endif
+
 /* Decode one UTF-16 code point starting at *sp, advancing *sp past it (2
  * units for a valid surrogate pair, 1 otherwise -- an unpaired surrogate
  * decodes as itself). Extracted from jsvm2's include/js_string.h; this is
@@ -179,8 +194,16 @@ static inline bool class_contains(const CharClass* cls, uint32_t cp) {
  * shallow-parsing pattern needs ~30) and made every Thread carry 192 bytes
  * of mostly-dead state. MAX_COUNTERS now only caps the compile-time id
  * space, so raising it costs nothing per-thread. */
+/* run is what makes an entry of the backtrack stack a run's (OP_CHAR_RUN,
+ * OP_CLASS_RUN, at pc): the code units between sp, where the run's last
+ * repetition tried so far ends, and the end of the repetitions it cannot do
+ * without. 0 in every other entry and in the thread that is running, which
+ * is why a copy can carry it along with pc (one store for the two, where
+ * clearing it was a second one on every push and pop). Unsigned, for a run
+ * is at most INT_MAX repetitions of at most two units each. It sits in what
+ * was padding wherever a pointer is 8 bytes. */
 typedef struct {
-    int pc; const uint16_t* sp; const uint16_t** captures; int* counters; const uint16_t** counter_sp;
+    int pc; unsigned int run; const uint16_t* sp; const uint16_t** captures; int* counters; const uint16_t** counter_sp;
 } Thread;
 
 /* The whole hash: the caller masks it to the cache's current size (always a
@@ -207,6 +230,7 @@ static inline unsigned int hash_state(const Thread* t, int counter_count, const 
  * dst aliasing src's capture state instead of owning an independent copy. */
 static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pairs, int counter_count) {
     dst->pc = src->pc;
+    dst->run = src->run;
     dst->sp = src->sp;
     memcpy((void*)dst->captures, src->captures, sizeof(const uint16_t*) * (size_t)cap_pairs);
     /* Guarded: counter-free patterns leave the counter pointers NULL, and
@@ -229,7 +253,8 @@ static inline void thread_copy_state(Thread* dst, const Thread* src, int cap_pai
 /* What a context's backtrack stacks may hold, all depths together, unless
  * the host says otherwise (vm_context_set_stack_limit). The greedy-quantifier
  * loop (OP_CHECK_COUNTER) pushes one backtrack entry per iteration, so a
- * single quantifier matching a run of N units needs N live entries -- the
+ * quantifier whose body is more than one unit (the one-unit ones are runs,
+ * OP_CHAR_RUN, and hold one entry) needs N live entries for N iterations -- the
  * stack was a fixed Thread[512] with UNCHECKED pushes, meaning e.g. [a-z]+
  * against 600 consecutive letters wrote past its end (confirmed via ASan:
  * heap-buffer-overflow in thread_copy_state -- a text-driven memory-safety
@@ -509,6 +534,98 @@ static bool vm_grow_cache(VMContext* ctx, VMDepth* d, int cc) {
     return true;
 }
 
+/* One step against the budget, and the interrupt's poll. False when the
+ * match is to be abandoned. */
+VM_INLINE bool vm_count_step(VMContext* ctx) {
+    if (ctx->step_budget) {
+        if (++ctx->steps_used > ctx->step_budget) {
+            ctx->budget_exhausted = true;
+            return false;
+        }
+        if (!(ctx->steps_used & 4095) && ctx->interrupt && *ctx->interrupt) {
+            ctx->budget_exhausted = ctx->interrupted = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Whether the unit at *sp -- a code point under /u, a code unit otherwise;
+ * the one before it when step < 0, which is how a lookbehind reads -- is in
+ * `cls`, or with none is the literal `ch` (OP_CHAR's arg1, `fold` its
+ * arg2), and *sp moved past it if so. The one test for OP_CHAR, OP_CLASS
+ * and the runs of either, in both directions: they were four copies, which
+ * is how a bounds check came to be on one side and not on its mirror, and a
+ * run must match exactly what a loop of the single instruction did. */
+VM_INLINE bool match_unit(bool unicode, const CharClass* cls, uint32_t ch, bool fold, int step, const uint16_t** sp, const uint16_t* text, const uint16_t* text_end) {
+    const uint16_t* p = *sp;
+    uint32_t cp;
+    if (step > 0) {
+        if (p >= text_end) return false;
+        if (unicode) cp = decode_utf16(&p, text_end);
+        else cp = *p++;
+    } else {
+        if (p <= text) return false;
+        if (unicode) cp = decode_utf16_backward(&p, text);
+        else cp = *--p;
+    }
+    if (cls) {
+        if (class_contains(cls, cp) == cls->negated) return false;
+    } else {
+        /* ch was canonicalized at emit time (see re_compiler.c's
+         * emit_char_operand); only the input side needs folding here. */
+        if (fold) cp = unicode ? unicode_casefold(cp) : annexb_canonicalize(cp);
+        if (cp != ch) return false;
+    }
+    *sp = p;
+    return true;
+}
+
+/* A greedy quantifier over one unit (OP_CHAR_RUN, OP_CLASS_RUN) takes every
+ * repetition it can in one instruction and saves one backtrack entry for all
+ * of them, where the counter loop saves one for each: the entry says how far
+ * the run went (sp) and how much of that it can give back (run). Taken up
+ * again, it gives back one repetition -- one unit, found by reading the text
+ * the other way, which under /u is a code point as the way out read it: a
+ * surrogate pair inside the run is a pair from either end, and one that
+ * straddles the run's first position is not in it, which is why the reading
+ * stops there -- and goes on after the quantifier from where that leaves it,
+ * staying on the stack until it has nothing left to give. So the order of
+ * the attempts is the loop's, longest first, and a run of any length costs
+ * one entry.
+ *
+ * What it costs in steps: one for each repetition it takes, counted as it
+ * goes so that a budget or an interrupt stops it inside a long run, and one
+ * for each it gives back. The first is less work than a step of the loop it
+ * replaces, which took four for a repetition (3.5 to 5 ns for a literal or
+ * a small class, 10 for \p{L}'s 700 ranges, where a step that goes on is 5
+ * to 6), and the second, a thread copied and a path begun, is a step's
+ * like any other entry taken up again; a step counted for several
+ * repetitions would stand for more time than any other step does, and a
+ * host that prices a step would be selling the run short. */
+
+/* The repetitions the run `in` takes from *sp, which it leaves where they
+ * end, with *least where the ones it must have end (a run that has not that
+ * many has failed). -1 when the match is to be abandoned. */
+VM_NOINLINE int vm_scan_run(VMContext* ctx, const Program* prog, const Instruction* in, int step, const uint16_t** sp, const uint16_t* text, const uint16_t* text_end, const uint16_t** least) {
+    const bool unicode = prog->unicode;
+    const CharClass* cls = in->op == OP_CLASS_RUN ? &prog->classes[in->arg1] : NULL;
+    const uint32_t ch = (uint32_t)in->arg1;
+    const bool fold = in->arg2 != 0;
+    const int min = in->arg4, max = in->arg3 < 0 ? INT_MAX : in->arg3;
+    const uint16_t* p = *sp;
+    const uint16_t* end = p;
+    int n = 0;
+    while (n < max) {
+        if (!vm_count_step(ctx)) return -1;
+        if (!match_unit(unicode, cls, ch, fold, step, &p, text, text_end)) break;
+        if (++n == min) end = p;
+    }
+    *sp = p;
+    *least = end;
+    return n;
+}
+
 static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int step, const uint16_t* original_text, const uint16_t* text_end, const uint16_t* search_start, const uint16_t** out_captures) {
     int cap_pairs = ctx->cap_pairs;
     /* Unreachable with the Program the context was created for (its
@@ -593,6 +710,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
     current.counter_sp = d->current_counter_sp;
 
     stack[0].pc = start_pc;
+    stack[0].run = 0;
     stack[0].sp = search_start;
     memset((void*)stack[0].captures, 0, sizeof(const uint16_t*) * (size_t)cap_pairs);
     if (out_captures) memcpy((void*)stack[0].captures, out_captures, sizeof(const uint16_t*) * (size_t)cap_pairs);
@@ -603,8 +721,32 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
     stack_ptr = 1;
 
     while (stack_ptr > 0) {
-        stack_ptr--;
-        thread_copy_state(&current, &stack[stack_ptr], cap_pairs, cc);
+        Thread* top = &stack[stack_ptr - 1];
+        if (top->run) {
+            /* a run gives back a repetition and stays, unless that was its last */
+            if (!vm_count_step(ctx)) return false;
+            const uint16_t* sp = top->sp;
+            if (step > 0) {
+                const uint16_t* least = sp - top->run;
+                if (prog->unicode) decode_utf16_backward(&sp, least);
+                else sp--;
+                top->run = (unsigned int)(sp - least);
+            } else {
+                const uint16_t* least = sp + top->run;
+                if (prog->unicode) decode_utf16(&sp, least);
+                else sp++;
+                top->run = (unsigned int)(least - sp);
+            }
+            top->sp = sp;
+            unsigned int left = top->run;
+            thread_copy_state(&current, top, cap_pairs, cc);
+            current.pc++;
+            current.run = 0;
+            if (!left) stack_ptr--;
+        } else {
+            stack_ptr--;
+            thread_copy_state(&current, top, cap_pairs, cc);
+        }
 
         unsigned int path_hash = 0;
         /* Snapshot the popped state's counters (into d->path_counters):
@@ -635,16 +777,7 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
              * safe for the same reason the stack limit's abandon is: all
              * scratch is context-owned and (re)initialized per entry, so a
              * plain return leaves the context reusable. */
-            if (ctx->step_budget) {
-                if (++ctx->steps_used > ctx->step_budget) {
-                    ctx->budget_exhausted = true;
-                    return false;
-                }
-                if (!(ctx->steps_used & 4095) && ctx->interrupt && *ctx->interrupt) {
-                    ctx->budget_exhausted = ctx->interrupted = true;
-                    return false;
-                }
-            }
+            if (!vm_count_step(ctx)) return false;
             Instruction inst = prog->code[current.pc];
             /* A dense switch over the opcode enum compiles to a jump table
              * where the old if/else-if chain compiled to sequential
@@ -655,61 +788,32 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
              * exit -- same control flow, one extra branch on failure. */
             switch (inst.op) {
             case OP_CHAR: {
-                if (step > 0) {
-                    if (current.sp < text_end) {
-                        uint32_t cp;
-                        const uint16_t* next_sp = current.sp;
-                        if (prog->unicode) cp = decode_utf16(&next_sp, text_end);
-                        else cp = *next_sp++;
-                        
-                        if (inst.arg2) {
-                            /* arg1 was canonicalized at emit time (see
-                             * re_compiler.c's emit_char_operand); only the
-                             * input side needs folding here. */
-                            uint32_t match_cp = prog->unicode ? unicode_casefold(cp) : annexb_canonicalize(cp);
-                            if ((uint32_t)inst.arg1 == match_cp) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
-                        } else {
-                            if (cp == (uint32_t)inst.arg1) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
-                        }
-                    } else { path_failed = true; break; }
-                } else {
-                    if (current.sp > original_text) {
-                        const uint16_t* next_sp = current.sp;
-                        uint32_t cp;
-                        if (prog->unicode) cp = decode_utf16_backward(&next_sp, original_text);
-                        else cp = *(--next_sp);
-                        if (inst.arg2) {
-                            uint32_t match_cp = prog->unicode ? unicode_casefold(cp) : annexb_canonicalize(cp);
-                            if ((uint32_t)inst.arg1 == match_cp) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
-                        } else {
-                            if (cp == (uint32_t)inst.arg1) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
-                        }
-                    } else { path_failed = true; break; }
-                }
+                if (match_unit(prog->unicode, NULL, (uint32_t)inst.arg1, inst.arg2 != 0, step, &current.sp, original_text, text_end)) current.pc++;
+                else { path_failed = true; break; }
             } break;
             case OP_CLASS: {
-                if (step > 0) {
-                    if (current.sp < text_end) {
-                        uint32_t cp;
-                        const uint16_t* next_sp = current.sp;
-                        if (prog->unicode) cp = decode_utf16(&next_sp, text_end);
-                        else cp = *next_sp++;
-                        CharClass* cls = &prog->classes[inst.arg1];
-                        bool matched = class_contains(cls, cp);
-                        if (cls->negated) matched = !matched;
-                        if (matched) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
-                    } else { path_failed = true; break; }
-                } else {
-                    if (current.sp > original_text) {
-                        const uint16_t* next_sp = current.sp;
-                        uint32_t cp;
-                        if (prog->unicode) cp = decode_utf16_backward(&next_sp, original_text);
-                        else cp = *(--next_sp);
-                        CharClass* cls = &prog->classes[inst.arg1];
-                        bool matched = class_contains(cls, cp);
-                        if (cls->negated) matched = !matched;
-                        if (matched) { current.pc++; current.sp = next_sp; } else { path_failed = true; break; }
-                    } else { path_failed = true; break; }
+                if (match_unit(prog->unicode, &prog->classes[inst.arg1], 0, false, step, &current.sp, original_text, text_end)) current.pc++;
+                else { path_failed = true; break; }
+            } break;
+            case OP_CHAR_RUN:
+            case OP_CLASS_RUN: {
+                const uint16_t* sp = current.sp;
+                const uint16_t* least;
+                int n = vm_scan_run(ctx, prog, &inst, step, &sp, original_text, text_end, &least);
+                if (n < 0) return false;
+                if (n < inst.arg4) { path_failed = true; break; }
+                current.sp = sp;
+                current.pc++;
+                if (sp != least) {
+                    if (stack_ptr == stack_capacity) {
+                        if (!vm_grow_stack(ctx, d, cap_pairs, cc)) return false;
+                        stack = d->stack;
+                        stack_capacity = d->capacity;
+                    }
+                    thread_copy_state(&stack[stack_ptr], &current, cap_pairs, cc);
+                    stack[stack_ptr].pc = current.pc - 1;
+                    stack[stack_ptr].run = (unsigned int)(step > 0 ? sp - least : least - sp);
+                    stack_ptr++;
                 }
             } break;
             case OP_SAVE: { current.captures[inst.arg1] = current.sp; current.pc++; } break;
@@ -816,19 +920,29 @@ static bool vm_run(Program* prog, VMContext* ctx, int depth, int start_pc, int s
                         }
                     } else {
                         int len = end - start;
+                        const uint16_t* temp_sp = current.sp;
                         if (step > 0) {
-                            const uint16_t* temp_sp = current.sp;
                             for (int i = 0; i < len; i++) {
                                 if (temp_sp >= text_end || *temp_sp++ != start[i]) { match = false; break; }
                             }
-                            if (match) current.sp = temp_sp;
                         } else {
-                            const uint16_t* temp_sp = current.sp;
                             for (int i = len - 1; i >= 0; i--) {
                                 if (temp_sp <= original_text || *(--temp_sp) != start[i]) { match = false; break; }
                             }
-                            if (match) current.sp = temp_sp;
                         }
+                        /* Under /u the capture is code points and so is what
+                         * it is compared with: a capture that ends in a lone
+                         * lead surrogate is not the first half of a pair in
+                         * the text (nor, read backward, one that begins with
+                         * a lone trail the second half), though the units
+                         * are equal. Where the reading began is a code point
+                         * boundary already, so only where it stops needs the
+                         * look. */
+                        if (match && prog->unicode && len > 0 && temp_sp > original_text && temp_sp < text_end &&
+                            temp_sp[-1] >= 0xD800 && temp_sp[-1] <= 0xDBFF && *temp_sp >= 0xDC00 && *temp_sp <= 0xDFFF) {
+                            match = false;
+                        }
+                        if (match) current.sp = temp_sp;
                     }
                     if (match) {
                         current.pc++;

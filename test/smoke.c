@@ -144,6 +144,139 @@ static void flaky_sweep(const char* pattern, int flags, const char* subject, boo
     free(pat); free(text);
 }
 
+/* The flag bits of a string of flag letters. */
+static int flag_bits(const char* letters) {
+    int flags = 0;
+    for (; *letters; letters++) flags |= regex_flag_bit(*letters);
+    return flags;
+}
+
+/* How many runs (OP_CHAR_RUN, OP_CLASS_RUN) a pattern compiles to; -1 if it
+ * does not compile. */
+static int run_count(const char* pattern, int flags) {
+    uint16_t* u = to_utf16(pattern);
+    Program* prog = (Program*)calloc(1, sizeof(Program));
+    compile_into(prog, u, flags);
+    int runs = prog->error ? -1 : 0;
+    for (int i = 0; !prog->error && i < prog->code_count; i++)
+        if (prog->code[i].op == OP_CHAR_RUN || prog->code[i].op == OP_CLASS_RUN) runs++;
+    program_release(prog);
+    free(prog);
+    free(u);
+    return runs;
+}
+
+/* A subject written in ASCII: H is a lead surrogate (U+D83D) and L a trail
+ * (U+DE00), so "HL" is U+1F600 and either alone is a lone surrogate. */
+static uint16_t* surrogate_subject(const char* s) {
+    uint16_t* t = to_utf16(s);
+    for (size_t i = 0; s[i]; i++) t[i] = s[i] == 'H' ? 0xD83D : s[i] == 'L' ? 0xDE00 : t[i];
+    return t;
+}
+
+/* One search from the start of a subject (written as surrogate_subject
+ * reads it) against the spans it should give: the match and then each group,
+ * COUNT numbers in all, none for no match. Says which case it was when it
+ * is wrong. */
+typedef struct { const char* pattern; const char* flags; const char* subject; int count; int want[6]; } SpanCase;
+static bool span_case(const SpanCase* sc) {
+    uint16_t* p = to_utf16(sc->pattern);
+    uint16_t* t = surrogate_subject(sc->subject);
+    uintptr_t h = regex_compile(p, 0, flag_bits(sc->flags));
+    bool ok = h != 0;
+    if (ok) {
+        int m = regex_exec(h, t, (int)strlen(sc->subject), 0);
+        const int32_t* caps = regex_captures_ptr(h);
+        ok = m == (sc->count > 0);
+        for (int i = 0; ok && i < sc->count; i++) ok = caps[i] == sc->want[i];
+    }
+    if (!ok) printf("       /%s/%s on \"%s\"\n", sc->pattern, sc->flags, sc->subject);
+    if (h) regex_free(h);
+    free(p); free(t);
+    return ok;
+}
+
+static uint64_t run_rng_state;
+static unsigned run_rng(unsigned n) {
+    run_rng_state ^= run_rng_state << 13;
+    run_rng_state ^= run_rng_state >> 7;
+    run_rng_state ^= run_rng_state << 17;
+    return (unsigned)((run_rng_state >> 11) % n);
+}
+
+/* One unit, quantified or not, appended to a pattern in its two forms: A as
+ * written, and B with every quantified unit X as (?:X(?:)), which matches
+ * what X matches and is not one unit to the compiler, so that A's
+ * quantifier is a run and B's the counter loop. Under /u a lone surrogate is
+ * written as a class: as an escape it would pair with an escape beside it
+ * in A and not in B, where a group stands between them. */
+static void run_add_unit(char* a, char* b, bool unicode, bool quantified) {
+    static const char* const plain[] = {"a", "b", "A", "[ab]", "[^a]", ".", "\\w", "\\s", "\\uD83D", "\\uDE00", "[\\uD83D\\uDE00]", "[^\\uDE00]"};
+    static const char* const uni[] = {"a", "b", "A", "[ab]", "[^a]", ".", "\\w", "\\S", "\\u{1F600}", "[\\u{1F600}a]", "[\\uD83D]", "[\\uDE00]", "\\p{L}", "[^\\u{1F600}]"};
+    static const char* const quants[] = {"*", "+", "?", "{2}", "{1,3}", "{2,}", "{0}", "{0,2}", "{3}"};
+    const char* u = unicode ? uni[run_rng(14)] : plain[run_rng(12)];
+    if (!quantified) {
+        strcat(a, u);
+        strcat(b, u);
+        return;
+    }
+    const char* q = quants[run_rng(9)];
+    strcat(a, u); strcat(a, q);
+    strcat(b, "(?:"); strcat(b, u); strcat(b, "(?:))"); strcat(b, q);
+}
+
+static void run_add_both(char* a, char* b, const char* s) {
+    strcat(a, s);
+    strcat(b, s);
+}
+
+/* A random pattern of one to five atoms around quantified units: bare, in
+ * captures that may themselves repeat, in loops with a second unit, in
+ * lookarounds either way, before backreferences and across alternatives. */
+static void run_random_pattern(char* a, char* b, bool unicode) {
+    static const char* const closes[] = {")", ")*", ")+", "){1,2}", ")?", ")+?"};
+    int groups = 0;
+    a[0] = b[0] = 0;
+    for (int atoms = 1 + (int)run_rng(5); atoms > 0; atoms--) {
+        switch (run_rng(14)) {
+        case 0: case 1: case 2: case 3: case 4: run_add_unit(a, b, unicode, true); break;
+        case 5: case 6: run_add_unit(a, b, unicode, false); break;
+        case 7:
+            run_add_both(a, b, "(");
+            run_add_unit(a, b, unicode, true);
+            run_add_both(a, b, closes[run_rng(6)]);
+            groups++;
+            break;
+        case 8:
+            run_add_both(a, b, run_rng(2) ? "(?:" : "(");
+            if (a[strlen(a) - 1] == '(') groups++;
+            run_add_unit(a, b, unicode, true);
+            run_add_unit(a, b, unicode, run_rng(2) != 0);
+            run_add_both(a, b, closes[run_rng(6)]);
+            break;
+        case 9:
+            run_add_both(a, b, run_rng(4) ? "(?<=" : "(?<!");
+            if (run_rng(2)) run_add_unit(a, b, unicode, false);
+            run_add_unit(a, b, unicode, true);
+            if (run_rng(2)) run_add_unit(a, b, unicode, false);
+            run_add_both(a, b, ")");
+            break;
+        case 10:
+            run_add_both(a, b, run_rng(4) ? "(?=" : "(?!");
+            run_add_unit(a, b, unicode, true);
+            run_add_unit(a, b, unicode, false);
+            run_add_both(a, b, ")");
+            break;
+        case 11:
+            if (groups) run_add_both(a, b, "\\1");
+            else run_add_unit(a, b, unicode, true);
+            break;
+        case 12: run_add_both(a, b, "|"); break;
+        case 13: run_add_both(a, b, run_rng(2) ? "^" : "$"); break;
+        }
+    }
+}
+
 int main(void) {
     /* Basic match + capture groups, case-insensitive flag. */
     {
@@ -390,17 +523,18 @@ int main(void) {
         /* MAX_COUNTERS = 256 (was 16 back when every Thread embedded the
          * full counter arrays; the VM right-sizes all counter storage to
          * the pattern's actual count now): exactly at the limit succeeds,
-         * one more fails cleanly. */
-        char* patA = malloc(256 * 8 + 1); patA[0] = 0;
-        for (int i = 0; i < 256; i++) { char b[8]; snprintf(b, sizeof(b), "%c{1,2}", 'a' + (i % 26)); strcat(patA, b); }
+         * one more fails cleanly. The bodies are two units because a
+         * quantifier over one is a run, which has no counter. */
+        char* patA = malloc(256 * 16 + 1); patA[0] = 0;
+        for (int i = 0; i < 256; i++) { char b[16]; snprintf(b, sizeof(b), "(?:%cz){1,2}", 'a' + (i % 26)); strcat(patA, b); }
         uint16_t* pA = to_utf16(patA);
         uintptr_t hA = regex_compile(pA, 0, 0);
         check(hA != 0, "MAX_COUNTERS: exactly 256 bounded quantifiers compiles");
         if (hA) regex_free(hA);
         free(patA); free(pA);
 
-        char* patB = malloc(257 * 8 + 1); patB[0] = 0;
-        for (int i = 0; i < 257; i++) { char b[8]; snprintf(b, sizeof(b), "%c{1,2}", 'a' + (i % 26)); strcat(patB, b); }
+        char* patB = malloc(257 * 16 + 1); patB[0] = 0;
+        for (int i = 0; i < 257; i++) { char b[16]; snprintf(b, sizeof(b), "(?:%cz){1,2}", 'a' + (i % 26)); strcat(patB, b); }
         uint16_t* pB = to_utf16(patB);
         uintptr_t hB = regex_compile(pB, 0, 0);
         check(hB == 0, "MAX_COUNTERS: 257 bounded quantifiers is a clean compile error, not a crash");
@@ -1070,7 +1204,9 @@ int main(void) {
 
         /* The stack's bound is bytes, and reaching it is "could not finish":
          * it was 2^19 entries and read as no match, so /^[a-z]+$/ answered
-         * false for 600,000 letters. */
+         * false for 600,000 letters. That pattern is a run now and holds one
+         * entry however long the subject; a loop over two units still saves
+         * an entry for each time round, and is what the bound is tested on. */
         {
             int big = 600000;
             uint16_t* run = (uint16_t*)malloc(sizeof(uint16_t) * big);
@@ -1080,29 +1216,42 @@ int main(void) {
             compile_into(prog, pa, 0);
             const uint16_t* caps2[4] = {0};
             VMContext* c = vm_context_new(prog);
+            check(vm_execute(prog, c, 0, 1, run, run + 4, run, caps2), "a short run matches");
+            size_t entry = vm_context_stack_bytes(c) / 16;
             check(vm_execute(prog, c, 0, 1, run, run + big, run, caps2) && caps2[1] == run + big &&
                   !vm_context_budget_exhausted(c),
                   "^[a-z]+$ matches a 600k-unit run (was: no match past 2^19 backtrack entries)");
-            check(vm_context_stack_bytes(c) > (size_t)big * 40 && vm_context_stack_bytes(c) <= ((size_t)64 << 20),
+            check(vm_context_stack_bytes(c) == entry * 16, "and its stack is the 16 entries a context begins with");
+            vm_context_free(c);
+            program_release(prog);
+            free(pa);
+
+            pa = to_utf16("^(?:[a-z][a-z])+$");
+            compile_into(prog, pa, 0);
+            c = vm_context_new(prog);
+            check(vm_execute(prog, c, 0, 1, run, run + big, run, caps2) && caps2[1] == run + big &&
+                  !vm_context_budget_exhausted(c),
+                  "^(?:[a-z][a-z])+$ matches a 600k-unit subject");
+            check(vm_context_stack_bytes(c) > (size_t)(big / 2) * 40 && vm_context_stack_bytes(c) <= ((size_t)64 << 20),
                   "the context reports what its stacks hold, within the default limit");
             vm_context_free(c);
 
             /* a limit of a thousand entries: the last growth is what still fits, not a doubling */
             c = vm_context_new(prog);
-            check(vm_execute(prog, c, 0, 1, run, run + 4, run, caps2), "a short run matches");
-            size_t entry = vm_context_stack_bytes(c) / 16;
+            check(vm_execute(prog, c, 0, 1, run, run + 4, run, caps2), "a short subject matches");
+            entry = vm_context_stack_bytes(c) / 16;
             vm_context_set_stack_limit(c, entry * 1000);
-            check(vm_execute(prog, c, 0, 1, run, run + 990, run, caps2) && !vm_context_stack_exhausted(c),
-                  "a run that fits the stack limit matches");
+            check(vm_execute(prog, c, 0, 1, run, run + 1980, run, caps2) && !vm_context_stack_exhausted(c),
+                  "a loop that fits the stack limit matches");
             check(vm_context_stack_bytes(c) == entry * 1000, "the stack grows to its limit exactly");
-            check(!vm_execute(prog, c, 0, 1, run, run + 1100, run, caps2) &&
+            check(!vm_execute(prog, c, 0, 1, run, run + 2200, run, caps2) &&
                   vm_context_budget_exhausted(c) && vm_context_stack_exhausted(c) && !vm_context_interrupted(c),
-                  "a run past the stack limit is reported as one that could not be finished");
+                  "a loop past the stack limit is reported as one that could not be finished");
             check(!vm_execute(prog, c, 0, 1, run, run + 4, run, caps2),
                   "and the context refuses until it is re-armed");
             vm_context_set_step_budget(c, 0);
             check(!vm_context_budget_exhausted(c) && !vm_context_stack_exhausted(c) &&
-                  vm_execute(prog, c, 0, 1, run, run + 990, run, caps2),
+                  vm_execute(prog, c, 0, 1, run, run + 1980, run, caps2),
                   "re-arming clears it and the context matches again");
             vm_context_free(c);
             program_release(prog);
@@ -1904,6 +2053,231 @@ int main(void) {
                     "stack and fail-cache growth: allocation refused from each point on is reported, nothing leaks");
         flaky_sweep("(?<a>x)|(?<a>y)|(?:(?<b>p)|(?<b>q))\\k<b>", 0, "zqq", false,
                     "duplicate names and \\k: each allocation refused once is reported, nothing leaks");
+    }
+
+
+    /* Runs: a greedy quantifier over one literal or one class is one
+     * instruction that takes every repetition it can and holds one backtrack
+     * entry for all of them. */
+    {
+        check(run_count("a+", 0) == 1 && run_count("[a-z]*", 0) == 1 && run_count(".{2,5}", 0) == 1 &&
+              run_count("\\d?", 0) == 1 && run_count("x{3}", 0) == 1 && run_count("\\p{L}+", flag_bits("u")) == 1 &&
+              run_count("a+", flag_bits("i")) == 1 && run_count("[^\\n]*\\w+", 0) == 2,
+              "a greedy quantifier over a literal or a class compiles to a run");
+        check(run_count("(?:a)+", 0) == 1 && run_count("(?:(?:[ab]))*", 0) == 1,
+              "and so does one over a group that only wraps the unit");
+        check(run_count("a+?", 0) == 0 && run_count("[a-z]*?", 0) == 0 && run_count("(a)+", 0) == 0 &&
+              run_count("(?:ab)+", 0) == 0 && run_count("(?:a|b)+", 0) == 0 && run_count("(?:a(?:))+", 0) == 0 &&
+              run_count("(?:^)*", 0) == 0 && run_count("[\\q{ab}c]+", flag_bits("v")) == 0 &&
+              run_count("(?<n>a)+", 0) == 0 && run_count("(?i:a)+", 0) == 0,
+              "a lazy quantifier, a capture, a longer body, a group with flags and a class with strings stay loops");
+
+        /* What V8 answers (node 26), as the spans of the match and its groups. */
+        static const SpanCase cases[] = {
+            {"^(a*)(a*)$", "", "aaa", 6, {0, 3, 0, 3, 3, 3}},
+            {"^(a+)(a+)$", "", "aaa", 6, {0, 3, 0, 2, 2, 3}},
+            {"(a{2,4})(a{2})", "", "aaaaa", 6, {0, 5, 0, 3, 3, 5}},
+            {"a{0}b", "", "ab", 2, {1, 2}},
+            {"xa{3}", "", "xaaaa", 2, {0, 4}},
+            {"xa{3}$", "", "xaa", 0, {0}},
+            {"a*b", "", "xxaab", 2, {2, 5}},
+            {"[ab]*c|a", "", "aab", 2, {0, 1}},
+            {"(?:a)+b", "", "caab", 2, {1, 4}},
+            {"A+b", "i", "xaAab", 2, {1, 5}},
+            {"^.*\\uDE00", "", "HLHL", 2, {0, 4}},
+            {"^.*\\uDE00", "u", "HLHL", 0, {0}},
+            {"^.+(.)$", "u", "HLHL", 4, {0, 4, 2, 4}},
+            {"^.{2}$", "u", "HLHL", 2, {0, 4}},
+            {"^.{2}", "", "HLHL", 2, {0, 2}},
+            {"(?<=a+)b", "", "caab", 2, {3, 4}},
+            {"(?<=(a+))b", "", "caab", 4, {3, 4, 1, 3}},
+            {"(?<=^.*)\\uDE00", "u", "HLL", 2, {2, 3}},
+            {"(?<=.+)$", "u", "LHL", 2, {3, 3}},
+            {"(?<=(.{1,2}))$", "u", "LHL", 4, {3, 3, 0, 3}},
+            {"(?<=\\uDE00*)x", "u", "HLLx", 2, {3, 4}},
+            {"(?<=([\\uDE00]+))x", "u", "HLLx", 4, {3, 4, 2, 3}},
+            {"(?<=([\\uDE00]+))x", "", "HLLx", 4, {3, 4, 1, 3}},
+            {"^[\\uD83D]+", "u", "HHL", 2, {0, 1}},
+            {"^[\\uD83D]+", "", "HHL", 2, {0, 2}},
+            {"^[^a]*\\uDE00", "u", "HHLL", 2, {0, 4}},
+        };
+        int wrong = 0;
+        for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+            if (run_count(cases[k].pattern, flag_bits(cases[k].flags)) <= 0 || !span_case(&cases[k])) wrong++;
+        }
+        check(wrong == 0, "runs give back longest first, a code point at a time under /u, in either direction, as V8 does");
+
+        /* Found by matching random run patterns against V8: a backreference
+         * under /u compared units, and took a capture that was a lone lead
+         * surrogate to be repeated by the first half of a pair. */
+        static const SpanCase halves[] = {
+            {"(.)\\1", "u", "HHL", 0, {0}},
+            {"(.)\\1", "u", "HHx", 4, {0, 2, 0, 1}},
+            {"(.)\\1", "ui", "HHL", 0, {0}},
+            {"(.)\\1", "", "HHL", 4, {0, 2, 0, 1}},
+            {"(?<a>.)\\k<a>", "u", "HHL", 0, {0}},
+            {"(.+)\\1", "u", "aHaHL", 0, {0}},
+            {"(.+)\\1", "u", "aHaHa", 4, {0, 4, 0, 2}},
+            {"(?<=\\1(.))x", "u", "HLLx", 0, {0}},
+            {"(?<=\\1(.))x", "u", "LLx", 4, {2, 3, 1, 2}},
+            {"(?<=\\1(.))x", "", "HLLx", 4, {3, 4, 2, 3}},
+        };
+        wrong = 0;
+        for (size_t k = 0; k < sizeof(halves) / sizeof(halves[0]); k++) {
+            if (!span_case(&halves[k])) wrong++;
+        }
+        check(wrong == 0, "a /u backreference to a lone surrogate does not match half of a pair, forward or backward");
+
+        /* A lookahead may be quantified where neither /u nor /v is set
+         * (Annex B), with V8's answers: a repetition that matched nothing
+         * is thrown away with what it captured, unless the minimum asked
+         * for it. */
+        static const SpanCase ahead[] = {
+            {"(?=a)+", "", "ab", 2, {0, 0}},
+            {"(?=a)*b", "", "ab", 2, {1, 2}},
+            {"(?!a){2}", "", "ab", 2, {1, 1}},
+            {"(?=(a))+b", "", "ab", 0, {0}},
+            {"(?=(a))*a", "", "ab", 4, {0, 1, -1, -1}},
+            {"(?=(a))?a", "", "ab", 4, {0, 1, -1, -1}},
+            {"(?=(a)){0}a", "", "ab", 4, {0, 1, -1, -1}},
+            {"(?=(a)){2,}?a", "", "ab", 4, {0, 1, 0, 1}},
+            {"(?!(a))*?b", "", "ab", 4, {1, 2, -1, -1}},
+            {"x(?=(a))+", "", "xab", 4, {0, 1, 1, 2}},
+            {"(?=(a))+?ab", "", "aab", 4, {1, 3, 1, 2}},
+        };
+        wrong = 0;
+        for (size_t k = 0; k < sizeof(ahead) / sizeof(ahead[0]); k++) {
+            if (!span_case(&ahead[k])) wrong++;
+        }
+        check(wrong == 0, "a quantified lookahead compiles without /u and repeats as V8 has it");
+        {
+            static const char* const refused[][2] = {{"(?=a)+", "u"}, {"(?!a)*", "v"}, {"(?=a){2}", "u"}, {"(?<=a)+", ""},
+                                                     {"(?<!a)*", ""}, {"(?<=a)?", "u"}};
+            wrong = 0;
+            for (size_t k = 0; k < sizeof(refused) / sizeof(refused[0]); k++) {
+                uint16_t* p = to_utf16(refused[k][0]);
+                uintptr_t h = regex_compile(p, 0, flag_bits(refused[k][1]));
+                if (h) { regex_free(h); wrong++; printf("       /%s/%s\n", refused[k][0], refused[k][1]); }
+                free(p);
+            }
+            check(wrong == 0, "and is a compile error under /u or /v, as a quantified lookbehind is anywhere");
+        }
+
+        /* The same pattern as runs and as loops, from every start of random
+         * subjects with surrogates paired and lone. */
+        {
+            static const uint16_t alphabet[] = {'a', 'b', 'A', 'c', '\n', '_', ' ', 0xE9, 0xD83D, 0xDE00};
+            char a[512], b[1024];
+            int compared = 0, matched = 0, with_runs = 0, differ = 0, loops_with_runs = 0;
+            run_rng_state = 0x9E3779B97F4A7C15ull;
+            for (int round = 0; round < 6000; round++) {
+                int flags = 0;
+                bool unicode = run_rng(2) != 0;
+                if (unicode) flags |= regex_flag_bit('u');
+                if (!run_rng(4)) flags |= regex_flag_bit('i');
+                if (!run_rng(4)) flags |= regex_flag_bit('s');
+                if (!run_rng(8)) flags |= regex_flag_bit('m');
+                run_random_pattern(a, b, unicode);
+                int len = (int)run_rng(15);
+                /* tightly sized, so that a read past either end is ASan's to see */
+                uint16_t* t = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)(len ? len : 1));
+                for (int i = 0; i < len; i++) {
+                    unsigned pick = run_rng(12);
+                    if (pick >= 10 && i + 1 < len) { t[i++] = 0xD83D; t[i] = 0xDE00; }
+                    else t[i] = alphabet[pick % 10];
+                }
+                uint16_t* ua = to_utf16(a);
+                uint16_t* ub = to_utf16(b);
+                uintptr_t ha = regex_compile(ua, 0, flags), hb = regex_compile(ub, 0, flags);
+                if (!ha != !hb) {
+                    if (differ++ < 5) printf("       /%s/ and /%s/ (flags %d): one compiles\n", a, b, flags);
+                } else if (ha) {
+                    int runs = run_count(a, flags);
+                    if (runs > 0) with_runs++;
+                    if (run_count(b, flags) != 0) loops_with_runs++;
+                    int pairs = (regex_group_count(ha) + 1) * 2;
+                    regex_set_step_budget(ha, 2e6);
+                    regex_set_step_budget(hb, 2e6);
+                    for (int start = 0; start <= len; start++) {
+                        int32_t got[MAX_GROUPS * 2];
+                        int ma = regex_exec(ha, t, len, start);
+                        memcpy(got, regex_captures_ptr(ha), sizeof(int32_t) * (size_t)pairs);
+                        int mb = regex_exec(hb, t, len, start);
+                        if (regex_budget_exhausted(ha) || regex_budget_exhausted(hb)) continue;
+                        compared++;
+                        if (ma) matched++;
+                        if (ma != mb || regex_group_count(hb) * 2 + 2 != pairs ||
+                            memcmp(got, regex_captures_ptr(hb), sizeof(int32_t) * (size_t)pairs) != 0) {
+                            if (differ++ < 5) {
+                                printf("       /%s/ against /%s/ (flags %d) from %d of", a, b, flags, start);
+                                for (int i = 0; i < len; i++) printf(" %04x", t[i]);
+                                printf(": %d and %d\n", ma, mb);
+                            }
+                        }
+                    }
+                }
+                if (ha) regex_free(ha);
+                if (hb) regex_free(hb);
+                free(ua); free(ub); free(t);
+            }
+            check(with_runs > 4000 && loops_with_runs == 0 && compared > 30000 && matched > 5000,
+                  "6000 random patterns: the one form has runs, the other none, and both are searched");
+            check(differ == 0, "and a pattern matches the same as runs as it does as loops, in every capture");
+        }
+
+        /* A run's steps: one for each repetition, counted as it goes, so a
+         * budget stops it at the step it runs out on and an interrupt within
+         * 4096 of them. */
+        {
+            int big = 3000000;
+            uint16_t* text = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)big);
+            for (int i = 0; i < big; i++) text[i] = (uint16_t)('a' + (i % 26));
+            uint16_t* p = to_utf16("^[a-z]*$");
+            Program* prog = (Program*)calloc(1, sizeof(Program));
+            compile_into(prog, p, 0);
+            const uint16_t* caps[2] = {0};
+            VMContext* c = vm_context_new(prog);
+            size_t stack0 = vm_context_stack_bytes(c);
+            vm_context_set_step_budget(c, 1ull << 40);
+            bool m0 = vm_execute(prog, c, 0, 1, text, text, text, caps);
+            uint64_t empty = vm_context_steps_used(c);
+            vm_context_set_step_budget(c, 1ull << 40);
+            bool m1 = vm_execute(prog, c, 0, 1, text, text + 1000, text, caps);
+            check(m0 && m1 && vm_context_steps_used(c) == empty + 1000, "a run takes a step for each repetition");
+            vm_context_set_step_budget(c, 1ull << 40);
+            check(vm_execute(prog, c, 0, 1, text, text + big, text, caps) && caps[1] == text + big &&
+                  vm_context_stack_bytes(c) <= stack0 + 16 * 64,
+                  "a run of three million units matches on the stack a context begins with");
+            vm_context_set_step_budget(c, 500);
+            check(!vm_execute(prog, c, 0, 1, text, text + big, text, caps) && vm_context_budget_exhausted(c) &&
+                  !vm_context_interrupted(c) && vm_context_steps_used(c) == 501,
+                  "a budget that ends inside a run stops it there");
+            volatile int stop = 1;
+            vm_context_set_step_budget(c, 1ull << 40);
+            vm_context_set_interrupt(c, &stop);
+            check(!vm_execute(prog, c, 0, 1, text, text + big, text, caps) && vm_context_interrupted(c) &&
+                  vm_context_steps_used(c) <= 4096,
+                  "an interrupt set during a run abandons it within 4096 steps");
+            vm_context_free(c);
+            program_release(prog);
+            free(p);
+
+            /* no digit follows: every repetition is given back, on one entry */
+            p = to_utf16("^[a-z]+\\d");
+            compile_into(prog, p, 0);
+            c = vm_context_new(prog);
+            vm_context_set_step_budget(c, 1ull << 40);
+            check(!vm_execute(prog, c, 0, 1, text, text + big, text, caps) && !vm_context_budget_exhausted(c) &&
+                  vm_context_stack_bytes(c) <= stack0 + 16 * 64,
+                  "and one that must give every repetition back ends in no match, not in a full stack");
+            check(vm_context_steps_used(c) > 2 * (uint64_t)big && vm_context_steps_used(c) < 4 * (uint64_t)big,
+                  "at a step for each repetition given back and one for what is tried after it");
+            vm_context_free(c);
+            program_release(prog);
+            free(prog);
+            free(p);
+            free(text);
+        }
     }
 
     if (failures == 0) {

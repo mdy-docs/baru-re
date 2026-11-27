@@ -289,6 +289,26 @@ static void compile_node(ASTNode* node, Program* prog, bool rtl) {
             patch_arg1(prog, jmp, prog->code_count); break;
         }
         case AST_QUANTIFIER: {
+            /* A greedy quantifier over a single literal or class is one
+             * instruction (see OP_CHAR_RUN in re_vm.c): the loop below
+             * saves a backtrack entry for every repetition, so the longest
+             * run of letters [a-z]+ could cross was what the backtrack
+             * stack had room for (about 700,000 at its 64MB), and a longer
+             * one was a match the engine could not finish. Nothing to
+             * clear and nothing to count: the body has no group, and it
+             * never matches empty. A class with strings is an alternation,
+             * not one unit, and stays a loop; so does a lazy quantifier,
+             * which holds one entry however far it goes. */
+            ASTNode* unit = node->left;
+            while (unit && unit->type == AST_GROUP && unit->id == 0) unit = unit->left;
+            if (!node->lazy && unit && unit->type == AST_LITERAL) {
+                emit(prog, OP_CHAR_RUN, emit_char_operand(prog, unit->ch), prog->ignore_case, node->max, node->min, false);
+                break;
+            }
+            if (!node->lazy && unit && unit->type == AST_CLASS && prog->classes[unit->id].string_count == 0) {
+                emit(prog, OP_CLASS_RUN, unit->id, 0, node->max, node->min, false);
+                break;
+            }
             /* Bounds-checked against MAX_COUNTERS (a
              * confirmed stack-buffer-overflow: a pattern with more
              * than MAX_COUNTERS bounded quantifiers wrote past the VM's
@@ -450,6 +470,9 @@ static void compute_scan_filter(Program* prog) {
         switch (in->op) {
             case OP_CHAR: scan_add_char(prog, in); break;
             case OP_CLASS: scan_add_class(prog, &prog->classes[in->arg1]); break;
+            /* a run that may be empty begins with its unit or with whatever follows it */
+            case OP_CHAR_RUN: scan_add_char(prog, in); if (in->arg4 == 0) work[wp++] = pc + 1; break;
+            case OP_CLASS_RUN: scan_add_class(prog, &prog->classes[in->arg1]); if (in->arg4 == 0) work[wp++] = pc + 1; break;
             case OP_SAVE: case OP_INIT_COUNTER: case OP_INC_COUNTER:
             case OP_CLEAR_CAPTURES:
             case OP_ASSERT_START: case OP_ASSERT_END:

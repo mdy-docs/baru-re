@@ -210,9 +210,12 @@ static ASTNode* parse_quantifier(Lexer* lexer) {
     if (!node) return NULL;
     TokenType t = lexer->current.type;
     if (t == TOK_STAR || t == TOK_PLUS || t == TOK_QUESTION || t == TOK_BOUNDS) {
-        /* Lookahead/lookbehind assertions cannot be quantified */
-        if (node->type == AST_LOOKAHEAD || node->type == AST_NEG_LOOKAHEAD ||
-            node->type == AST_LOOKBEHIND || node->type == AST_NEG_LOOKBEHIND) {
+        /* A lookbehind cannot be quantified, nor a lookahead under /u or
+         * /v; without them a lookahead can (Annex B's QuantifiableAssertion,
+         * which V8 and the web have: /(?=a)*b/), and repeats as a group
+         * that matches nothing does. */
+        if (node->type == AST_LOOKBEHIND || node->type == AST_NEG_LOOKBEHIND ||
+            ((node->type == AST_LOOKAHEAD || node->type == AST_NEG_LOOKAHEAD) && lexer->prog->unicode)) {
             lexer->prog->error = "SyntaxError: Invalid quantifier applied to assertion";
         }
         ASTNode* q = create_node(lexer, AST_QUANTIFIER);
